@@ -116,4 +116,161 @@ with st.container():
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 설정")
-    # ⚠️ OpenRouter에서
+    # ⚠️ OpenRouter에서 실제 제공되는 모델 id 형태로 갱신 (예시)
+    model = st.selectbox(
+        "🤖 사용할 LLM 모델",
+        [
+            "qwen/qwen2.5-72b-instruct",
+            "qwen/qwen2.5-32b-instruct",
+            "mistralai/mistral-7b-instruct",
+            "mistralai/mixtral-8x7b-instruct",
+        ]
+    )
+    role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
+
+# ✅ 세션 초기화
+if "last_uploaded_file" not in st.session_state:
+    st.session_state.last_uploaded_file = None
+if "last_model" not in st.session_state:
+    st.session_state.last_model = None
+if "last_role" not in st.session_state:
+    st.session_state.last_role = None
+if "llm_result" not in st.session_state:
+    st.session_state.llm_result = None
+if "parsed_df" not in st.session_state:
+    st.session_state.parsed_df = None
+
+uploaded_file = st.file_uploader("📂 소스코드 zip 파일 업로드", type=["zip"])
+
+def need_llm_call(uploaded_file, model, role):
+    return (
+        uploaded_file is not None
+        and (
+            st.session_state.last_uploaded_file != uploaded_file.name
+            or st.session_state.last_model != model
+            or st.session_state.last_role != role
+        )
+    )
+
+# ─────────────────────────────────────────────
+# 🔗 OpenRouter 호출 공통 헤더 (권장값 포함)
+# ─────────────────────────────────────────────
+def openrouter_headers():
+    return {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        # 아래 헤더는 권장(분석/출처 표기를 위해). 값은 앱 상황에 맞게.
+        "HTTP-Referer": "https://tc-bot.example",  # 배포 URL 있으면 넣기
+        "X-Title": "TC-Bot v3",
+    }
+
+# ─────────────────────────────────────────────
+# ✅ LLM 호출 조건 확인
+# ─────────────────────────────────────────────
+if uploaded_file and need_llm_call(uploaded_file, model, role):
+    if not API_KEY:
+        st.error("🔑 OpenRouter API Key가 비어 있습니다. (현재 하드코딩 사용 중)")
+    else:
+        with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = os.path.join(tmpdir, uploaded_file.name)
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_file.read())
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdir)
+
+                full_code = ""
+                for root, _, files in os.walk(tmpdir):
+                    for file in files:
+                        if file.endswith((".py", ".java", ".js", ".ts", ".cpp", ".c", ".cs")):
+                            file_path = os.path.join(root, file)
+                            try:
+                                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    code = f.read()
+                                    rel = os.path.relpath(file_path, tmpdir)
+                                    full_code += f"\n\n# FILE: {rel}\n{code}"
+                            except Exception:
+                                continue
+
+            prompt = f"""
+너는 시니어 QA 엔지니어이며, 현재 '{role}' 역할을 맡고 있다.
+아래에 제공된 소스코드를 분석하여 기능 단위의 테스트 시나리오 기반 테스트케이스를 생성하라.
+
+📌 출력 형식은 아래 마크다운 테이블 형태로 작성하되,
+우선순위는 반드시 High / Medium / Low 중 하나로 작성할 것:
+
+| TC ID | 기능 설명 | 입력값 | 예상 결과 | 우선순위 |
+|-------|-----------|--------|-----------|----------|
+
+소스코드:
+{full_code}
+"""
+
+            # ✅ LLM 호출
+            try:
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=openrouter_headers(),
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=60,
+                )
+                # 상태코드 비정상일 때 상세 본문 함께 표시
+                if response.status_code != 200:
+                    st.error(f"LLM 호출 실패: HTTP {response.status_code}")
+                    try:
+                        st.code(response.text, language="json")
+                    except Exception:
+                        pass
+                    response.raise_for_status()
+            except requests.RequestException as e:
+                st.error(f"LLM 호출 실패: {e}")
+                response = None
+
+            if response is not None:
+                try:
+                    result = response.json()["choices"][0]["message"]["content"]
+                except Exception as e:
+                    st.error(f"응답 파싱 실패: {e}")
+                    result = ""
+
+                st.session_state.llm_result = result
+
+                # ✅ 결과 파싱
+                rows = []
+                for line in result.splitlines():
+                    if "|" in line and "TC" in line:
+                        parts = [p.strip() for p in line.strip().split("|")[1:-1]]
+                        if len(parts) == 5:
+                            rows.append(parts)
+
+                if rows:
+                    df = pd.DataFrame(
+                        rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"]
+                    )
+                    st.session_state.parsed_df = df
+
+                # ✅ 세션 상태 업데이트
+                st.session_state.last_uploaded_file = uploaded_file.name
+                st.session_state.last_model = model
+                st.session_state.last_role = role
+
+# ✅ 결과 렌더링
+if st.session_state.llm_result:
+    st.success("✅ 테스트케이스 생성 완료!")
+    st.markdown("## 📋 생성된 테스트케이스")
+    st.markdown(st.session_state.llm_result)
+
+# ✅ 엑셀 다운로드
+if st.session_state.parsed_df is not None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        st.session_state.parsed_df.to_excel(tmp.name, index=False)
+        tmp.seek(0)
+        st.download_button(
+            "⬇️ 엑셀 다운로드",
+            data=tmp.read(),
+            file_name="테스트케이스.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
