@@ -18,12 +18,9 @@ from pathlib import Path
 def normalize_api_key(raw: str) -> str:
     if not raw:
         return ""
-    # 제로폭/비가시문자 제거
-    raw = re.sub(r"[\u200B\u200C\u200D\u2060\ufeff]", "", raw)
-    # 유니코드 대시 → ASCII '-'
-    raw = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", raw)
-    # 모든 공백 제거
-    raw = re.sub(r"\s+", "", raw)
+    raw = re.sub(r"[\u200B\u200C\u200D\u2060\ufeff]", "", raw)  # 제로폭 제거
+    raw = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", raw)  # 유니코드 대시 정규화
+    raw = re.sub(r"\s+", "", raw)  # 공백/개행 제거
     return raw.strip()
 
 def fingerprint(s: str) -> str:
@@ -135,41 +132,48 @@ with st.container():
         data=sample_zip_bytes,
         file_name="tc-bot-sample-code.zip",
         mime="application/zip",
+        key="dl_sample_zip",
         help="예제 소스(zip)를 내려받아 바로 업로드 테스트에 사용하세요."
     )
 
 # ─────────────────────────────────────────────
-# 🔗 OpenRouter 헤더 빌더 (서버/브라우저 키 지원)
+# 🔗 헤더 빌더 (서버/브라우저 키 지원)
 # ─────────────────────────────────────────────
 def headers_server_only():
     return {"Authorization": f"Bearer {API_KEY}"}
 
 def headers_browser_mode(referer: str, title: str = "TC-Bot v3"):
-    # Browser(Client) 키는 아래 2개 헤더가 필수 + referer는 허용된 도메인과 일치
-    h = {"Authorization": f"Bearer {API_KEY}",
-         "HTTP-Referer": referer,
-         "X-Title": title}
-    return h
+    return {
+        "Authorization": f"Bearer {API_KEY}",
+        "HTTP-Referer": referer,
+        "X-Title": title
+    }
 
 # ─────────────────────────────────────────────
 # 🔎 프리플라이트 + 키 지문(사이드바)
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("🔎 키/연결 프리플라이트")
-    st.caption("키 지문 (앞/뒤 4자리 + sha256-10):")
+    st.caption("키 지문 (앞/뒤 4자리 + sha256-10)")
     st.code(fingerprint(API_KEY))
-    st.write("• Prefix OK?" , API_KEY.startswith("sk-or-v1-"))
-    st.write("• Contains space?", " " in API_KEY)
-
-    # Browser 키라면 허용 도메인과 일치해야 함 → 사용자가 입력
-    st.divider()
-    st.caption("Browser 키일 수 있으니 실제 앱 URL을 입력하세요 (로컬 기본값).")
-    referer_input = st.text_input("HTTP-Referer (도메인)", value="http://localhost:8501")
-
-    if st.checkbox("프리플라이트 실행(/v1/models)", value=False):
+    st.caption(
+        "Prefix OK: "
+        + ("✅" if API_KEY.startswith("sk-or-v1-") else "❌")
+        + "  |  Contains space: "
+        + ("❌" if " " in API_KEY else "✅")
+    )
+    referer_input = st.text_input(
+        "HTTP-Referer (도메인)",
+        value="http://localhost:8501",
+        key="http_referer_input"
+    )
+    if st.checkbox("프리플라이트 실행(/v1/models)", value=False, key="prefetch_models"):
         try:
-            r = requests.get("https://openrouter.ai/api/v1/models",
-                             headers=headers_server_only(), timeout=15)
+            r = requests.get(
+                "https://openrouter.ai/api/v1/models",
+                headers=headers_server_only(),
+                timeout=15
+            )
             st.write("프리플라이트 상태:", r.status_code)
             if r.status_code == 200:
                 st.success("✅ 키 유효 · 네트워크 정상")
@@ -180,12 +184,20 @@ with st.sidebar:
             st.error(f"연결 오류: {e}")
 
 # ─────────────────────────────────────────────
-# ✅ 사이드바 입력 (소스1과 동일 alias)
+# ✅ 사이드바 입력 (고유 key 부여)
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 설정")
-    model = st.selectbox("🤖 사용할 LLM 모델", ["qwen/qwen-max", "mistral"])
-    role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
+    model = st.selectbox(
+        "🤖 사용할 LLM 모델",
+        ["qwen/qwen-max", "mistral"],
+        key="model_select"
+    )
+    role = st.selectbox(
+        "👤 QA 역할",
+        ["기능 QA", "보안 QA", "성능 QA"],
+        key="role_select"
+    )
 
 # ✅ 세션 초기화
 session_defaults = {
@@ -201,7 +213,12 @@ for k, v in session_defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-uploaded_file = st.file_uploader("📂 소스코드 zip 파일 업로드", type=["zip"])
+# 📂 업로더 — 여기 ‘한 번만’ 호출 & 고유 key 지정
+uploaded_file = st.file_uploader(
+    "📂 소스코드 zip 파일 업로드",
+    type=["zip"],
+    key="zip_uploader"  # ← 중복 방지
+)
 
 def need_llm_call(uploaded_file, model, role):
     return (
@@ -247,7 +264,7 @@ def extract_functions(file_path: Path, text: str):
             seen.add(f)
     return uniq[:10]
 
-def analyze_source_tree(root_dir: str):
+def analyze_source_tree(root_dir: str, role: str):
     exts = []
     file_list = []
     functions = []
@@ -307,8 +324,7 @@ def call_openrouter(model: str, prompt: str, referer_for_retry: str, timeout=60)
     if resp.status_code != 401:
         return resp
 
-    # 2차: 401이면 Browser 키로 간주하고 Referer/X-Title 포함 재시도
-    #     (입력한 referer_for_retry는 허용된 도메인과 일치해야 함)
+    # 2차: 401이면 Browser 키로 간주하고 재시도 (Referer/X-Title 포함)
     resp2 = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers=headers_browser_mode(referer_for_retry, title="TC-Bot v3"),
@@ -321,14 +337,12 @@ def call_openrouter(model: str, prompt: str, referer_for_retry: str, timeout=60)
 # ─────────────────────────────────────────────
 # ✅ LLM 호출 파이프라인 + Auto-Flow Preview
 # ─────────────────────────────────────────────
-uploaded_file = st.file_uploader("📂 소스코드 zip 파일 업로드", type=["zip"])
-
 if uploaded_file and need_llm_call(uploaded_file, model, role):
     if not API_KEY:
         st.error("🔑 OpenRouter API Key가 비어 있습니다.")
     else:
         st.markdown("### 🔎 Auto-Flow Preview")
-        preview_col1, preview_col2, preview_col3, preview_col4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
         status_box = st.empty()
         stage_bar = st.progress(0, text="준비 중…")
         preview_placeholder = st.empty()
@@ -347,14 +361,14 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
 
             stage_bar.progress(40, text="언어/파일/함수 특징 추출…")
             status_box.info("🔍 언어 비율, 파일 개수, 함수/엔드포인트를 분석합니다.")
-            stats = analyze_source_tree(tmpdir)
+            stats = analyze_source_tree(tmpdir, role)
             st.session_state.preview_stats = stats
 
-            preview_col1.metric("파일 수", f"{stats['total_files']}개")
+            c1.metric("파일 수", f"{stats['total_files']}개")
             lang_top = stats["lang_counts"].most_common(1)[0][0] if stats["lang_counts"] else "-"
-            preview_col2.metric("주요 언어", lang_top)
-            preview_col3.metric("예상 TC 수", stats["estimated_cases"])
-            preview_col4.metric("감지된 함수/엔드포인트", f"{len(stats['top_functions'])}개")
+            c2.metric("주요 언어", lang_top)
+            c3.metric("예상 TC 수", stats["estimated_cases"])
+            c4.metric("감지된 함수/엔드포인트", f"{len(stats['top_functions'])}개")
 
             stage_bar.progress(60, text="미리보기 테스트케이스 생성…")
             st.session_state.preview_df = build_preview_testcases(stats)
@@ -442,6 +456,7 @@ if st.session_state.parsed_df is not None:
             data=tmp.read(),
             file_name="테스트케이스.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_excel"
         )
 
 # ✅ (언제든) 미리보기 보관 영역 표시
