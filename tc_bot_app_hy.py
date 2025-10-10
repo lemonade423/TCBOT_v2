@@ -7,13 +7,37 @@ import requests
 import io
 import re
 import time
+import hashlib
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-# ✅ OpenRouter API KEY (하드코딩 + 안전가드: 숨은 공백/개행 제거)
+# ─────────────────────────────────────────────
+# 🔐 API Key 정규화 도우미
+# ─────────────────────────────────────────────
+def normalize_api_key(raw: str) -> str:
+    if not raw:
+        return ""
+    # 1) 제로폭/비가시문자 제거
+    raw = re.sub(r"[\u200B\u200C\u200D\u2060\ufeff]", "", raw)
+    # 2) 유니코드 대시(– — - 등)를 ASCII 하이픈(-)으로 통일
+    raw = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", raw)
+    # 3) 탭/개행/캐리지리턴 등 모든 공백 제거
+    raw = re.sub(r"\s+", "", raw)
+    # 4) 양끝 공백 제거(안전망)
+    return raw.strip()
+
+def fingerprint(s: str) -> str:
+    if not s:
+        return "(empty)"
+    h = hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
+    head = s[:4] if len(s) >= 4 else s
+    tail = s[-4:] if len(s) >= 4 else s
+    return f"{head}…{tail} | sha256:{h}"
+
+# ✅ OpenRouter API KEY (하드코딩 + 정규화)
 _raw_key = "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"
-API_KEY = (_raw_key or "").strip()
+API_KEY = normalize_api_key(_raw_key)
 
 st.set_page_config(page_title="TC-Bot v3", layout="wide")
 st.title("🧪 TC-Bot v3: 테스트케이스 자동 생성기")
@@ -24,7 +48,6 @@ st.title("🧪 TC-Bot v3: 테스트케이스 자동 생성기")
 def build_sample_project_zip() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        # Python 샘플
         z.writestr(
             "sample_project_py/app.py",
             '''"""
@@ -54,7 +77,6 @@ if __name__ == "__main__":
         )
         z.writestr("sample_project_py/requirements.txt", "flask==3.0.3\n")
 
-        # Java 샘플
         z.writestr(
             "sample_project_java/src/main/java/com/example/CalcService.java",
             '''package com.example;
@@ -71,7 +93,6 @@ public class CalcService {
             "# Java 샘플\n- 간단한 사칙연산/짝수판별 메소드 포함"
         )
 
-        # JS 샘플
         z.writestr(
             "sample_project_js/index.js",
             '''// 간단한 입력 검증 + 합계
@@ -94,7 +115,6 @@ export function sum(a, b) {
 '''
         )
 
-        # 안내 문서
         z.writestr(
             "README.md",
             f"""# TC-Bot 샘플 코드 번들
@@ -124,23 +144,38 @@ with st.container():
     )
 
 # ─────────────────────────────────────────────
-# 🔗 OpenRouter 최소 헤더 (소스1과 동일 스펙)
+# 🔗 OpenRouter 최소 헤더 (소스1과 동일한 형태)
 # ─────────────────────────────────────────────
 def openrouter_headers():
     return {
         "Authorization": f"Bearer {API_KEY}",
-        # requests의 json= 사용 시 Content-Type 자동 설정됨
+        # requests의 json= 사용 시 Content-Type 자동 지정
     }
 
 # ─────────────────────────────────────────────
-# 🔎 프리플라이트(선택): 키/연결 사전 진단
+# 🔎 프리플라이트 + 키 지문 표시(사이드바)
 # ─────────────────────────────────────────────
 with st.sidebar:
-    if st.checkbox("🔎 OpenRouter 프리플라이트 실행", value=False):
+    st.header("🔎 키/연결 프리플라이트")
+    st.write("• Key fingerprint:", fingerprint(API_KEY))
+    s_checks = []
+    if API_KEY.startswith("sk-or-v1-"):
+        s_checks.append("Prefix OK")
+    else:
+        s_checks.append("Prefix ❌")
+    if " " in API_KEY:
+        s_checks.append("Space ❌")
+    else:
+        s_checks.append("No space")
+    st.caption(" / ".join(s_checks))
+
+    if st.checkbox("프리플라이트 실행(/v1/models)", value=False):
         try:
             r = requests.get("https://openrouter.ai/api/v1/models",
-                             headers=openrouter_headers(), timeout=15)
-            st.write("프리플라이트 /v1/models 상태:", r.status_code)
+                             headers=openrouter_headers(),
+                             timeout=15,
+                             allow_redirects=True)  # 소스1과 동일 기본
+            st.write("프리플라이트 상태:", r.status_code)
             if r.status_code == 200:
                 st.success("✅ 키 유효 · 통신 정상")
             else:
@@ -150,7 +185,7 @@ with st.sidebar:
             st.error(f"연결 오류: {e}")
 
 # ─────────────────────────────────────────────
-# ✅ 사이드바 입력 (소스1과 동일 alias 사용)
+# ✅ 사이드바 입력 (소스1과 동일 alias)
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 설정")
@@ -201,7 +236,6 @@ def extract_functions(file_path: Path, text: str):
     try:
         if file_path.suffix == ".py":
             funcs += re.findall(r"def\s+([a-zA-Z_]\w*)\s*\(", text)
-            # Flask/FastAPI endpoints
             funcs += re.findall(r"@app\.(?:get|post|put|delete|patch)\(['\"]/([^\)'\"]+)", text)
         elif file_path.suffix == ".java":
             funcs += re.findall(r"(?:public|private|protected)\s+[<>\w\[\]]+\s+([a-zA-Z_]\w*)\s*\(", text)
@@ -210,7 +244,6 @@ def extract_functions(file_path: Path, text: str):
             funcs += re.findall(r"export\s+function\s+([a-zA-Z_]\w*)\s*\(", text)
     except Exception:
         pass
-    # 중복 제거, 상위 10개만
     seen = set()
     uniq = []
     for f in funcs:
@@ -238,7 +271,6 @@ def analyze_source_tree(root_dir: str):
                     continue
     lang_counts = Counter(LANG_EXT[e] for e in exts)
     total_files = len(file_list)
-    # 간단한 예상 케이스 수: (함수 수 * 역할 가중치)
     weight = {"기능 QA": 1.2, "보안 QA": 1.1, "성능 QA": 1.0}.get(role, 1.0)
     estimated_cases = max(5, int(len(functions) * 1.5 * weight))
     return {
@@ -249,26 +281,20 @@ def analyze_source_tree(root_dir: str):
     }
 
 def build_preview_testcases(stats):
-    # 휴리스틱 기반 간단 미리보기 3건
     rows = []
-    # 1) 언어 비율 기반 공통 케이스
     lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
     rows.append(["TC-PV-001", "언어 혼합 프로젝트 로딩", f"언어분포: {lang_str}", "모든 파일 파싱 성공", "High"])
-
-    # 2) 함수명/엔드포인트 기반
     if stats["top_functions"]:
         fn = stats["top_functions"][0]
         rows.append(["TC-PV-002", f"핵심 함수/엔드포인트 동작 검증({fn})", "유효/무효 입력 2세트", "정상/에러 응답 구분", "High"])
     else:
         rows.append(["TC-PV-002", "엔드포인트/함수 미검출 시 기본 동작", "기본 실행", "에러 없이 앱 부팅", "Medium"])
-
-    # 3) 파일 수 기반 범위 테스트
     rows.append(["TC-PV-003", "대상 코드 범위 커버리지 초기 점검", f"파일 수={stats['total_files']}", "주요 모듈별 1개 이상 케이스 존재", "Medium"])
     df = pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
     return df
 
 # ─────────────────────────────────────────────
-# 🔗 OpenRouter 호출 래퍼 (최소 헤더 + 리다이렉트 차단)
+# 🔗 OpenRouter 호출 래퍼 (최소 헤더 + 소스1과 동일 리다이렉트 허용)
 # ─────────────────────────────────────────────
 def call_openrouter(model: str, prompt: str, timeout=60):
     if not API_KEY or not API_KEY.startswith("sk-or-v1-"):
@@ -282,7 +308,7 @@ def call_openrouter(model: str, prompt: str, timeout=60):
         headers=openrouter_headers(),
         json=payload,
         timeout=timeout,
-        allow_redirects=False,  # 리다이렉트 중 헤더 변형 방지(보수적)
+        allow_redirects=True,  # 소스1 기본 동작과 동일
     )
 
 # ─────────────────────────────────────────────
@@ -292,14 +318,12 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
     if not API_KEY:
         st.error("🔑 OpenRouter API Key가 비어 있습니다. (현재 하드코딩 사용 중)")
     else:
-        # Auto-Flow Preview 컨테이너
         st.markdown("### 🔎 Auto-Flow Preview")
         preview_col1, preview_col2, preview_col3, preview_col4 = st.columns(4)
         status_box = st.empty()
         stage_bar = st.progress(0, text="준비 중…")
         preview_placeholder = st.empty()
 
-        # 1) ZIP 추출 & 코드 파싱
         stage_bar.progress(10, text="코드 파싱 준비 중…")
         status_box.info("⏳ 업로드 파일을 임시 폴더에 추출합니다.")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -312,27 +336,23 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
                 zip_ref.extractall(tmpdir)
             time.sleep(0.2)
 
-            # 2) 특징 추출(언어/파일/함수)
             stage_bar.progress(40, text="언어/파일/함수 특징 추출…")
             status_box.info("🔍 언어 비율, 파일 개수, 함수/엔드포인트를 분석합니다.")
             stats = analyze_source_tree(tmpdir)
             st.session_state.preview_stats = stats
 
-            # 미리보기 메트릭 렌더
             preview_col1.metric("파일 수", f"{stats['total_files']}개")
             lang_top = stats["lang_counts"].most_common(1)[0][0] if stats["lang_counts"] else "-"
             preview_col2.metric("주요 언어", lang_top)
             preview_col3.metric("예상 TC 수", stats["estimated_cases"])
             preview_col4.metric("감지된 함수/엔드포인트", f"{len(stats['top_functions'])}개")
 
-            # 3) 휴리스틱 미리보기 TC 3건 표시
             stage_bar.progress(60, text="미리보기 테스트케이스 생성…")
             st.session_state.preview_df = build_preview_testcases(stats)
             with preview_placeholder.container():
                 st.caption("※ 아래 미리보기는 휴리스틱 기반으로 생성됩니다. 최종 결과는 LLM 생성 후 갱신됩니다.")
                 st.dataframe(st.session_state.preview_df, use_container_width=True)
 
-            # 4) 프롬프트 준비
             stage_bar.progress(75, text="프롬프트 구성…")
             status_box.info("🧠 LLM 프롬프트를 구성합니다.")
             full_code = ""
@@ -362,7 +382,6 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
 {full_code}
 """
 
-        # 5) LLM 호출
         stage_bar.progress(85, text="LLM 생성 중…")
         status_box.warning("🤖 LLM이 테스트케이스를 생성 중입니다. 잠시만 기다려 주세요…")
         try:
@@ -378,7 +397,6 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
             st.error(f"LLM 호출 실패: {e}")
             response = None
 
-        # 6) 결과 파싱 & 렌더
         if response is not None:
             try:
                 result = response.json()["choices"][0]["message"]["content"]
@@ -388,7 +406,6 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
 
             st.session_state.llm_result = result
 
-            # ✅ 마크다운 테이블 파싱
             rows = []
             for line in result.splitlines():
                 if "|" in line and "TC" in line:
@@ -401,11 +418,8 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
                     rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"]
                 )
 
-            # 진행상태 업데이트
             stage_bar.progress(100, text="완료")
             status_box.success("✅ 테스트케이스 생성 완료!")
-
-            # 미리보기 영역 치환/추가 안내
             st.markdown("## 📋 생성된 테스트케이스")
             st.markdown(st.session_state.llm_result)
 
