@@ -13,18 +13,17 @@ from datetime import datetime
 from pathlib import Path
 
 # ─────────────────────────────────────────────
-# 🔐 API Key 정규화 도우미
+# 🔐 API Key 정규화 / 지문
 # ─────────────────────────────────────────────
 def normalize_api_key(raw: str) -> str:
     if not raw:
         return ""
-    # 1) 제로폭/비가시문자 제거
+    # 제로폭/비가시문자 제거
     raw = re.sub(r"[\u200B\u200C\u200D\u2060\ufeff]", "", raw)
-    # 2) 유니코드 대시(– — - 등)를 ASCII 하이픈(-)으로 통일
+    # 유니코드 대시 → ASCII '-'
     raw = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", raw)
-    # 3) 탭/개행/캐리지리턴 등 모든 공백 제거
+    # 모든 공백 제거
     raw = re.sub(r"\s+", "", raw)
-    # 4) 양끝 공백 제거(안전망)
     return raw.strip()
 
 def fingerprint(s: str) -> str:
@@ -76,7 +75,6 @@ if __name__ == "__main__":
 '''
         )
         z.writestr("sample_project_py/requirements.txt", "flask==3.0.3\n")
-
         z.writestr(
             "sample_project_java/src/main/java/com/example/CalcService.java",
             '''package com.example;
@@ -92,7 +90,6 @@ public class CalcService {
             "sample_project_java/README.md",
             "# Java 샘플\n- 간단한 사칙연산/짝수판별 메소드 포함"
         )
-
         z.writestr(
             "sample_project_js/index.js",
             '''// 간단한 입력 검증 + 합계
@@ -114,14 +111,12 @@ export function sum(a, b) {
 }
 '''
         )
-
         z.writestr(
             "README.md",
             f"""# TC-Bot 샘플 코드 번들
 업로드 없이도 테스트케이스 생성을 바로 시험할 수 있도록 만든 예제 소스입니다.
 - Python(Flask) / Java / JavaScript 예제 포함
 - 파서 검증용으로 다양한 확장자/디렉토리 구조 제공
-
 생성 시각: {datetime.now().isoformat(timespec='seconds')}
 """
         )
@@ -144,40 +139,40 @@ with st.container():
     )
 
 # ─────────────────────────────────────────────
-# 🔗 OpenRouter 최소 헤더 (소스1과 동일한 형태)
+# 🔗 OpenRouter 헤더 빌더 (서버/브라우저 키 지원)
 # ─────────────────────────────────────────────
-def openrouter_headers():
-    return {
-        "Authorization": f"Bearer {API_KEY}",
-        # requests의 json= 사용 시 Content-Type 자동 지정
-    }
+def headers_server_only():
+    return {"Authorization": f"Bearer {API_KEY}"}
+
+def headers_browser_mode(referer: str, title: str = "TC-Bot v3"):
+    # Browser(Client) 키는 아래 2개 헤더가 필수 + referer는 허용된 도메인과 일치
+    h = {"Authorization": f"Bearer {API_KEY}",
+         "HTTP-Referer": referer,
+         "X-Title": title}
+    return h
 
 # ─────────────────────────────────────────────
-# 🔎 프리플라이트 + 키 지문 표시(사이드바)
+# 🔎 프리플라이트 + 키 지문(사이드바)
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("🔎 키/연결 프리플라이트")
-    st.write("• Key fingerprint:", fingerprint(API_KEY))
-    s_checks = []
-    if API_KEY.startswith("sk-or-v1-"):
-        s_checks.append("Prefix OK")
-    else:
-        s_checks.append("Prefix ❌")
-    if " " in API_KEY:
-        s_checks.append("Space ❌")
-    else:
-        s_checks.append("No space")
-    st.caption(" / ".join(s_checks))
+    st.caption("키 지문 (앞/뒤 4자리 + sha256-10):")
+    st.code(fingerprint(API_KEY))
+    st.write("• Prefix OK?" , API_KEY.startswith("sk-or-v1-"))
+    st.write("• Contains space?", " " in API_KEY)
+
+    # Browser 키라면 허용 도메인과 일치해야 함 → 사용자가 입력
+    st.divider()
+    st.caption("Browser 키일 수 있으니 실제 앱 URL을 입력하세요 (로컬 기본값).")
+    referer_input = st.text_input("HTTP-Referer (도메인)", value="http://localhost:8501")
 
     if st.checkbox("프리플라이트 실행(/v1/models)", value=False):
         try:
             r = requests.get("https://openrouter.ai/api/v1/models",
-                             headers=openrouter_headers(),
-                             timeout=15,
-                             allow_redirects=True)  # 소스1과 동일 기본
+                             headers=headers_server_only(), timeout=15)
             st.write("프리플라이트 상태:", r.status_code)
             if r.status_code == 200:
-                st.success("✅ 키 유효 · 통신 정상")
+                st.success("✅ 키 유효 · 네트워크 정상")
             else:
                 st.error("❌ 프리플라이트 실패")
                 st.code(r.text)
@@ -294,29 +289,43 @@ def build_preview_testcases(stats):
     return df
 
 # ─────────────────────────────────────────────
-# 🔗 OpenRouter 호출 래퍼 (최소 헤더 + 소스1과 동일 리다이렉트 허용)
+# 🔗 OpenRouter 호출 (401이면 Browser 헤더로 자동 재시도)
 # ─────────────────────────────────────────────
-def call_openrouter(model: str, prompt: str, timeout=60):
+def call_openrouter(model: str, prompt: str, referer_for_retry: str, timeout=60):
     if not API_KEY or not API_KEY.startswith("sk-or-v1-"):
-        raise RuntimeError("API_KEY가 비어있거나 형식이 잘못되었습니다. (예: sk-or-v1-...)")
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    return requests.post(
+        raise RuntimeError("API_KEY 형식 오류 (예: sk-or-v1-...)")
+    payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+
+    # 1차: 서버키 스타일 (Authorization만)
+    resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
-        headers=openrouter_headers(),
+        headers=headers_server_only(),
         json=payload,
         timeout=timeout,
-        allow_redirects=True,  # 소스1 기본 동작과 동일
+        allow_redirects=True,
     )
+    if resp.status_code != 401:
+        return resp
+
+    # 2차: 401이면 Browser 키로 간주하고 Referer/X-Title 포함 재시도
+    #     (입력한 referer_for_retry는 허용된 도메인과 일치해야 함)
+    resp2 = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers_browser_mode(referer_for_retry, title="TC-Bot v3"),
+        json=payload,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    return resp2
 
 # ─────────────────────────────────────────────
 # ✅ LLM 호출 파이프라인 + Auto-Flow Preview
 # ─────────────────────────────────────────────
+uploaded_file = st.file_uploader("📂 소스코드 zip 파일 업로드", type=["zip"])
+
 if uploaded_file and need_llm_call(uploaded_file, model, role):
     if not API_KEY:
-        st.error("🔑 OpenRouter API Key가 비어 있습니다. (현재 하드코딩 사용 중)")
+        st.error("🔑 OpenRouter API Key가 비어 있습니다.")
     else:
         st.markdown("### 🔎 Auto-Flow Preview")
         preview_col1, preview_col2, preview_col3, preview_col4 = st.columns(4)
@@ -385,7 +394,7 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
         stage_bar.progress(85, text="LLM 생성 중…")
         status_box.warning("🤖 LLM이 테스트케이스를 생성 중입니다. 잠시만 기다려 주세요…")
         try:
-            response = call_openrouter(model, prompt, timeout=60)
+            response = call_openrouter(model, prompt, referer_for_retry=referer_input, timeout=60)
             if response.status_code != 200:
                 st.error(f"LLM 호출 실패: HTTP {response.status_code}")
                 try:
