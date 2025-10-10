@@ -23,7 +23,6 @@ st.title("🧪 TC-Bot v3: 테스트케이스 자동 생성기")
 def build_sample_project_zip() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-        # Python 샘플
         z.writestr(
             "sample_project_py/app.py",
             '''"""
@@ -52,8 +51,6 @@ if __name__ == "__main__":
 '''
         )
         z.writestr("sample_project_py/requirements.txt", "flask==3.0.3\n")
-
-        # Java 샘플
         z.writestr(
             "sample_project_java/src/main/java/com/example/CalcService.java",
             '''package com.example;
@@ -69,8 +66,6 @@ public class CalcService {
             "sample_project_java/README.md",
             "# Java 샘플\n- 간단한 사칙연산/짝수판별 메소드 포함"
         )
-
-        # JS 샘플
         z.writestr(
             "sample_project_js/index.js",
             '''// 간단한 입력 검증 + 합계
@@ -92,8 +87,6 @@ export function sum(a, b) {
 }
 '''
         )
-
-        # 안내 문서
         z.writestr(
             "README.md",
             f"""# TC-Bot 샘플 코드 번들
@@ -127,15 +120,8 @@ with st.container():
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 설정")
-    model = st.selectbox(
-        "🤖 사용할 LLM 모델",
-        [
-            "qwen/qwen2.5-72b-instruct",
-            "qwen/qwen2.5-32b-instruct",
-            "mistralai/mistral-7b-instruct",
-            "mistralai/mixtral-8x7b-instruct",
-        ]
-    )
+    # ✅ 소스1과 동일한 alias로 통일
+    model = st.selectbox("🤖 사용할 LLM 모델", ["qwen/qwen-max", "mistral"])
     role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
 
 # ✅ 세션 초기화
@@ -182,7 +168,6 @@ def extract_functions(file_path: Path, text: str):
     try:
         if file_path.suffix == ".py":
             funcs += re.findall(r"def\s+([a-zA-Z_]\w*)\s*\(", text)
-            # Flask/FastAPI endpoints
             funcs += re.findall(r"@app\.(?:get|post|put|delete|patch)\(['\"]/([^\)'\"]+)", text)
         elif file_path.suffix == ".java":
             funcs += re.findall(r"(?:public|private|protected)\s+[<>\w\[\]]+\s+([a-zA-Z_]\w*)\s*\(", text)
@@ -191,7 +176,6 @@ def extract_functions(file_path: Path, text: str):
             funcs += re.findall(r"export\s+function\s+([a-zA-Z_]\w*)\s*\(", text)
     except Exception:
         pass
-    # 중복 제거, 상위 10개만
     seen = set()
     uniq = []
     for f in funcs:
@@ -219,7 +203,6 @@ def analyze_source_tree(root_dir: str):
                     continue
     lang_counts = Counter(LANG_EXT[e] for e in exts)
     total_files = len(file_list)
-    # 간단한 예상 케이스 수: (함수 수 * 역할 가중치)
     weight = {"기능 QA": 1.2, "보안 QA": 1.1, "성능 QA": 1.0}.get(role, 1.0)
     estimated_cases = max(5, int(len(functions) * 1.5 * weight))
     return {
@@ -230,34 +213,25 @@ def analyze_source_tree(root_dir: str):
     }
 
 def build_preview_testcases(stats):
-    # 휴리스틱 기반 간단 미리보기 3건
     rows = []
-    # 1) 언어 비율 기반 공통 케이스
     lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
     rows.append(["TC-PV-001", "언어 혼합 프로젝트 로딩", f"언어분포: {lang_str}", "모든 파일 파싱 성공", "High"])
-
-    # 2) 함수명/엔드포인트 기반
     if stats["top_functions"]:
         fn = stats["top_functions"][0]
         rows.append(["TC-PV-002", f"핵심 함수/엔드포인트 동작 검증({fn})", "유효/무효 입력 2세트", "정상/에러 응답 구분", "High"])
     else:
         rows.append(["TC-PV-002", "엔드포인트/함수 미검출 시 기본 동작", "기본 실행", "에러 없이 앱 부팅", "Medium"])
-
-    # 3) 파일 수 기반 범위 테스트
     rows.append(["TC-PV-003", "대상 코드 범위 커버리지 초기 점검", f"파일 수={stats['total_files']}", "주요 모듈별 1개 이상 케이스 존재", "Medium"])
     df = pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
     return df
 
 # ─────────────────────────────────────────────
-# 🔗 OpenRouter 헤더
+# 🔗 OpenRouter 헤더 (소스1과 동일하게 최소 헤더만)
 # ─────────────────────────────────────────────
 def openrouter_headers():
     return {
         "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://tc-bot.local",
-        "X-Title": "TC-Bot v3",
-        "Accept": "application/json",
+        # Content-Type은 requests의 json= 사용 시 자동 세팅되므로 생략해도 OK
     }
 
 # ─────────────────────────────────────────────
@@ -267,14 +241,12 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
     if not API_KEY:
         st.error("🔑 OpenRouter API Key가 비어 있습니다. (현재 하드코딩 사용 중)")
     else:
-        # Auto-Flow Preview 컨테이너
         st.markdown("### 🔎 Auto-Flow Preview")
         preview_col1, preview_col2, preview_col3, preview_col4 = st.columns(4)
         status_box = st.empty()
         stage_bar = st.progress(0, text="준비 중…")
         preview_placeholder = st.empty()
 
-        # 1) ZIP 추출 & 코드 파싱
         stage_bar.progress(10, text="코드 파싱 준비 중…")
         status_box.info("⏳ 업로드 파일을 임시 폴더에 추출합니다.")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -287,27 +259,23 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
                 zip_ref.extractall(tmpdir)
             time.sleep(0.2)
 
-            # 2) 특징 추출(언어/파일/함수)
             stage_bar.progress(40, text="언어/파일/함수 특징 추출…")
             status_box.info("🔍 언어 비율, 파일 개수, 함수/엔드포인트를 분석합니다.")
             stats = analyze_source_tree(tmpdir)
             st.session_state.preview_stats = stats
 
-            # 미리보기 메트릭 렌더
             preview_col1.metric("파일 수", f"{stats['total_files']}개")
             lang_top = stats["lang_counts"].most_common(1)[0][0] if stats["lang_counts"] else "-"
             preview_col2.metric("주요 언어", lang_top)
             preview_col3.metric("예상 TC 수", stats["estimated_cases"])
             preview_col4.metric("감지된 함수/엔드포인트", f"{len(stats['top_functions'])}개")
 
-            # 3) 휴리스틱 미리보기 TC 3건 표시
             stage_bar.progress(60, text="미리보기 테스트케이스 생성…")
             st.session_state.preview_df = build_preview_testcases(stats)
             with preview_placeholder.container():
                 st.caption("※ 아래 미리보기는 휴리스틱 기반으로 생성됩니다. 최종 결과는 LLM 생성 후 갱신됩니다.")
                 st.dataframe(st.session_state.preview_df, use_container_width=True)
 
-            # 4) 프롬프트 준비
             stage_bar.progress(75, text="프롬프트 구성…")
             status_box.info("🧠 LLM 프롬프트를 구성합니다.")
             full_code = ""
@@ -337,7 +305,6 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
 {full_code}
 """
 
-        # 5) LLM 호출
         stage_bar.progress(85, text="LLM 생성 중…")
         status_box.warning("🤖 LLM이 테스트케이스를 생성 중입니다. 잠시만 기다려 주세요…")
         try:
@@ -361,7 +328,6 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
             st.error(f"LLM 호출 실패: {e}")
             response = None
 
-        # 6) 결과 파싱 & 렌더
         if response is not None:
             try:
                 result = response.json()["choices"][0]["message"]["content"]
@@ -371,24 +337,19 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
 
             st.session_state.llm_result = result
 
-            # ✅ 마크다운 테이블 파싱
             rows = []
             for line in result.splitlines():
                 if "|" in line and "TC" in line:
                     parts = [p.strip() for p in line.strip().split("|")[1:-1]]
                     if len(parts) == 5:
                         rows.append(parts)
-
             if rows:
                 st.session_state.parsed_df = pd.DataFrame(
                     rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"]
                 )
 
-            # 진행상태 업데이트
             stage_bar.progress(100, text="완료")
             status_box.success("✅ 테스트케이스 생성 완료!")
-
-            # 미리보기 영역 치환/추가 안내
             st.markdown("## 📋 생성된 테스트케이스")
             st.markdown(st.session_state.llm_result)
 
