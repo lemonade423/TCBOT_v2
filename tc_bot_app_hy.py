@@ -146,4 +146,25 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
 
         if rows:
             df = pd.DataFrame(
-                rows, columns=["TC ID]()
+                rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
+            st.session_state.parsed_df = df
+
+        st.session_state.last_uploaded_file = uploaded_file.name
+        st.session_state.last_model = model
+        st.session_state.last_role = role
+        step_status.success("✅ LLM 응답 수신 및 파싱 완료!")
+
+# ✅ 결과 렌더링
+if st.session_state.llm_result:
+    st.success("✅ 테스트케이스 생성 완료!")
+    st.markdown("## 📋 생성된 테스트케이스")
+    st.markdown(st.session_state.llm_result)
+
+# ✅ 엑셀 다운로드
+if st.session_state.parsed_df is not None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        st.session_state.parsed_df.to_excel(tmp.name, index=False)
+        tmp.seek(0)
+        st.download_button("⬇️ 엑셀 다운로드",
+                           data=tmp.read(),
+                           file_name="테스트케이스.xlsx")
