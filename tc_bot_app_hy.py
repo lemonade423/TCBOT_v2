@@ -4,7 +4,14 @@ import zipfile
 import tempfile
 import pandas as pd
 import requests
-from io import BytesIO  # ✅ [추가] 샘플 ZIP 메모리 생성에 필요
+
+# --- [추가 import: 샘플 ZIP/프리뷰에만 사용, 기존 흐름에 영향 없음] ---
+import io
+import re
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+# -----------------------------------------------------------------------
 
 # ✅ OpenRouter API KEY (보안 주의!)
 API_KEY = "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"
@@ -13,64 +20,117 @@ st.set_page_config(page_title="TC-Bot v3", layout="wide")
 st.title("🧪 TC-Bot v3: 테스트케이스 자동 생성기")
 
 # =========================
-# ✅ [추가] 샘플코드 ZIP 생성 함수
+# 추가 기능 1) 📦 샘플코드 ZIP 다운로드
 # =========================
-def _build_sample_zip_bytes() -> bytes:
+def build_sample_project_zip() -> bytes:
     """
-    간단한 예제 소스 구조를 담은 ZIP을 메모리에서 생성하여 반환.
-    - README.md
-    - src/sample_app.py
-    - src/utils/helpers.py
+    업로드 없이도 파서/미리보기 흐름을 시험 가능한
+    Python/Java/JavaScript 혼합 샘플 프로젝트 ZIP을 in-memory로 생성
     """
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        # Python 샘플
+        z.writestr(
+            "sample_project_py/app.py",
+            '''"""
+샘플 파이썬 서비스
+- /health 엔드포인트: 상태 확인
+- /sum?a=1&b=2 합계 계산
+"""
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+@app.get("/sum")
+def sum_api():
+    try:
+        a = float(request.args.get("a", 0))
+        b = float(request.args.get("b", "0"))
+        return jsonify({"result": a + b})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+'''
+        )
+        z.writestr("sample_project_py/requirements.txt", "flask==3.0.3\n")
+
+        # Java 샘플
+        z.writestr(
+            "sample_project_java/src/main/java/com/example/CalcService.java",
+            '''package com.example;
+
+public class CalcService {
+    public int add(int a, int b) { return a + b; }
+    public int sub(int a, int b) { return a - b; }
+    public boolean isEven(int n) { return n % 2 == 0; }
+}
+'''
+        )
+        z.writestr(
+            "sample_project_java/README.md",
+            "# Java 샘플\n- 간단한 사칙연산/짝수판별 메소드 포함"
+        )
+
+        # JS 샘플
+        z.writestr(
+            "sample_project_js/index.js",
+            '''// 간단한 입력 검증 + 합계
+export function sum(a, b) {
+  if (typeof a !== "number" || typeof b !== "number") {
+    throw new Error("Invalid input");
+  }
+  return a + b;
+}
+'''
+        )
+        z.writestr(
+            "sample_project_js/package.json",
+            '''{
+  "name": "sample-project-js",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js"
+}
+'''
+        )
+
+        # 안내 문서
+        z.writestr(
             "README.md",
-            "# Sample Project for TC-Bot\n\n"
-            "This is a tiny sample to test TC extraction.\n"
-            "- Contains a trivial python app and helper.\n"
-            "- Upload this ZIP to see generated test cases.\n"
-        )
-        zf.writestr(
-            "src/sample_app.py",
-            'def add(a, b):\n'
-            '    """Return sum of a and b."""\n'
-            '    return a + b\n\n'
-            'def divide(a, b):\n'
-            '    """Divide a by b. Raises ZeroDivisionError if b==0."""\n'
-            '    return a / b\n\n'
-            'if __name__ == "__main__":\n'
-            '    print("OK")\n'
-        )
-        zf.writestr(
-            "src/utils/helpers.py",
-            'def normalize_username(name: str) -> str:\n'
-            '    """Trim and lower-case a username."""\n'
-            '    return (name or "").strip().lower()\n'
+            f"""# TC-Bot 샘플 코드 번들
+업로드 없이도 테스트케이스 생성을 바로 시험할 수 있도록 만든 예제 소스입니다.
+- Python(Flask) / Java / JavaScript 예제 포함
+- 파서 검증용으로 다양한 확장자/디렉토리 구조 제공
+
+생성 시각: {datetime.now().isoformat(timespec='seconds')}
+"""
         )
     buf.seek(0)
     return buf.read()
+
+with st.container():
+    st.subheader("📦 샘플코드 다운로드 (업로드 없이 바로 테스트)")
+    st.caption("파이썬/자바/자바스크립트 혼합 예제 포함 · 파서/미리보기 흐름 검증에 적합")
+    sample_zip_bytes = build_sample_project_zip()
+    st.download_button(
+        "⬇️ 샘플코드 .zip 다운로드",
+        data=sample_zip_bytes,
+        file_name="tc-bot-sample-code.zip",
+        mime="application/zip",
+        help="예제 소스(zip)를 내려받아 바로 업로드 테스트에 사용하세요.",
+        key="dl_sample_zip",
+    )
 
 # ✅ 사이드바 입력
 with st.sidebar:
     st.header("⚙️ 설정")
     model = st.selectbox("🤖 사용할 LLM 모델", ["qwen/qwen-max", "mistral"])
     role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
-
-    # =========================
-    # ✅ [추가] 샘플 ZIP 다운로드 버튼
-    # =========================
-    st.markdown("---")
-    st.subheader("📦 샘플 ZIP")
-    st.caption("업로드용 예제 ZIP 파일이 필요하면 아래 버튼으로 받으세요.")
-    sample_zip_bytes = _build_sample_zip_bytes()
-    st.download_button(
-        "⬇️ 샘플코드 ZIP 다운로드",
-        data=sample_zip_bytes,
-        file_name="sample_project.zip",
-        mime="application/zip",
-        help="예제 프로젝트 ZIP (README 및 간단한 Python 코드 포함)"
-    )
 
 # ✅ 세션 초기화
 if "last_uploaded_file" not in st.session_state:
@@ -84,25 +144,132 @@ if "llm_result" not in st.session_state:
 if "parsed_df" not in st.session_state:
     st.session_state.parsed_df = None
 
+# --- [추가: Auto-Flow Preview용 상태만 별도 key로 보관] ---
+st.session_state.setdefault("preview_stats", None)
+st.session_state.setdefault("preview_df", None)
+# ----------------------------------------------------------------
+
 uploaded_file = st.file_uploader("📂 소스코드 zip 파일 업로드", type=["zip"])
 
-
 def need_llm_call(uploaded_file, model, role):
-    # 이전 세션 상태와 비교
+    # 이전 세션 상태와 비교 (기존 로직 유지)
     return (uploaded_file is not None
             and (st.session_state.last_uploaded_file != uploaded_file.name
                  or st.session_state.last_model != model
                  or st.session_state.last_role != role))
 
+# =========================
+# 추가 기능 2) 🔎 Auto-Flow Preview
+#  - 업로드 ZIP을 LLM 호출 전에 빠르게 스캔하여
+#    (파일 수/언어/함수·엔드포인트) 요약 + 휴리스틱 미리보기 3건
+# =========================
+LANG_EXT = {
+    ".py": "Python",
+    ".java": "Java",
+    ".js": "JavaScript",
+    ".ts": "TypeScript",
+    ".cpp": "C++",
+    ".c": "C",
+    ".cs": "C#",
+}
+
+def extract_functions(file_path: Path, text: str):
+    funcs = []
+    try:
+        if file_path.suffix == ".py":
+            funcs += re.findall(r"def\s+([a-zA-Z_]\w*)\s*\(", text)
+            # Flask/FastAPI 엔드포인트 감지
+            funcs += re.findall(r"@app\.(?:get|post|put|delete|patch)\(['\"]/([^\)'\"]+)", text)
+        elif file_path.suffix == ".java":
+            funcs += re.findall(r"(?:public|private|protected)\s+[<>\w\[\]]+\s+([a-zA-Z_]\w*)\s*\(", text)
+        elif file_path.suffix in [".js", ".ts"]:
+            funcs += re.findall(r"function\s+([a-zA-Z_]\w*)\s*\(", text)
+            funcs += re.findall(r"export\s+function\s+([a-zA-Z_]\w*)\s*\(", text)
+    except Exception:
+        pass
+    # 중복 제거, 최대 10개
+    seen, uniq = set(), []
+    for f in funcs:
+        if f not in seen:
+            uniq.append(f); seen.add(f)
+    return uniq[:10]
+
+def analyze_source_tree(root_dir: str, role: str):
+    exts, file_list, functions = [], [], []
+    for r, _, files in os.walk(root_dir):
+        for fn in files:
+            p = Path(r) / fn
+            ext = p.suffix.lower()
+            if ext in LANG_EXT:
+                file_list.append(str(p))
+                exts.append(ext)
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        txt = f.read()
+                    functions.extend([f"{Path(p).name}:{n}" for n in extract_functions(p, txt)])
+                except Exception:
+                    continue
+    lang_counts = Counter(LANG_EXT[e] for e in exts)
+    total_files = len(file_list)
+    weight = {"기능 QA": 1.2, "보안 QA": 1.1, "성능 QA": 1.0}.get(role, 1.0)
+    estimated_cases = max(5, int(len(functions) * 1.5 * weight))
+    return {
+        "total_files": total_files,
+        "lang_counts": lang_counts,
+        "top_functions": functions[:10],
+        "estimated_cases": estimated_cases
+    }
+
+def build_preview_testcases(stats):
+    # 휴리스틱 기반 미리보기 3건
+    rows = []
+    lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
+    rows.append(["TC-PV-001", "언어 혼합 프로젝트 로딩", f"언어분포: {lang_str}", "모든 파일 파싱 성공", "High"])
+    if stats["top_functions"]:
+        fn = stats["top_functions"][0]
+        rows.append(["TC-PV-002", f"핵심 함수/엔드포인트 동작 검증({fn})", "유효/무효 입력 2세트", "정상/에러 응답 구분", "High"])
+    else:
+        rows.append(["TC-PV-002", "엔드포인트/함수 미검출 시 기본 동작", "기본 실행", "에러 없이 앱 부팅", "Medium"])
+    rows.append(["TC-PV-003", "대상 코드 범위 커버리지 초기 점검", f"파일 수={stats['total_files']}", "주요 모듈별 1개 이상 케이스 존재", "Medium"])
+    return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
+
+# 업로드되면, LLM 호출 조건과 상관없이 "미리보기"만 먼저 수행 (기존 로직에 영향 없음)
+if uploaded_file is not None:
+    with tempfile.TemporaryDirectory() as tmpdir_preview:
+        try:
+            # 업로드 ZIP 임시 저장/추출
+            zip_path = os.path.join(tmpdir_preview, uploaded_file.name)
+            with open(zip_path, "wb") as f:
+                f.write(uploaded_file.read())
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(tmpdir_preview)
+
+            # 분석 & 미리보기 표 생성
+            stats = analyze_source_tree(tmpdir_preview, role)
+            st.session_state.preview_stats = stats
+            st.session_state.preview_df = build_preview_testcases(stats)
+
+            # UI 표시
+            with st.expander("🔎 Auto-Flow Preview (LLM 호출 전 빠른 요약)", expanded=True):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("파일 수", f"{stats['total_files']}개")
+                lang_top = stats["lang_counts"].most_common(1)[0][0] if stats["lang_counts"] else "-"
+                c2.metric("주요 언어", lang_top)
+                c3.metric("예상 TC 수", stats["estimated_cases"])
+                c4.metric("함수/엔드포인트 감지", f"{len(stats['top_functions'])}개")
+                st.caption("※ 아래 미리보기는 휴리스틱 기반입니다. 최종 결과는 LLM 생성 후 갱신됩니다.")
+                st.dataframe(st.session_state.preview_df, use_container_width=True)
+
+        except Exception as e:
+            # 미리보기 실패해도 LLM 본 흐름은 그대로 진행 가능하도록 경고만 표기
+            st.warning(f"Auto-Flow Preview 중 경고: {e}")
+
+# =========================
+# (아래부터는 소스1의 기존 로직 그대로)
+# =========================
 
 # ✅ LLM 호출 조건 확인
 if uploaded_file and need_llm_call(uploaded_file, model, role):
-    # =========================
-    # ✅ [추가] 진행상황/미리보기 플레이스홀더
-    # =========================
-    preview_box = st.empty()       # 미리보기 영역
-    step_status = st.empty()       # 단계별 상태 표시
-
     with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, uploaded_file.name)
@@ -113,14 +280,11 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
                 zip_ref.extractall(tmpdir)
 
             full_code = ""
-            file_list = []  # ✅ [추가] 미리보기용 파일 목록
             for root, _, files in os.walk(tmpdir):
                 for file in files:
                     if file.endswith(
                         (".py", ".java", ".js", ".ts", ".cpp", ".c", ".cs")):
                         file_path = os.path.join(root, file)
-                        rel_display = os.path.relpath(file_path, tmpdir)
-                        file_list.append(rel_display)
                         try:
                             with open(file_path,
                                       "r",
@@ -145,23 +309,6 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
         소스코드:
         {full_code}
         """
-
-        # =========================
-        # ✅ [추가] LLM 동작 중 미리보기 UI
-        #  - 업로드된 파일 목록 상위 30개 표시
-        #  - 실제로 전송될 프롬프트의 앞부분(최대 2000자) 미리보기
-        # =========================
-        top_files = file_list[:30]
-        preview_prompt_head = prompt.strip()[:2000]  # 프롬프트 앞부분만
-        with st.expander("🔎 LLM 요청 미리보기 (전송 전 확인)", expanded=True):
-            st.markdown(f"**모델:** `{model}`  |  **역할:** `{role}`")
-            if top_files:
-                st.markdown("**분석 대상 파일(일부):**")
-                st.code("\n".join(top_files), language="text")
-            st.markdown("**프롬프트 프리뷰 (앞부분 2,000자):**")
-            st.code(preview_prompt_head, language="markdown")
-
-        step_status.info("🛰️ LLM API 호출 준비 완료…")
 
         # ✅ LLM 호출
         response = requests.post(
@@ -195,11 +342,6 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
         st.session_state.last_uploaded_file = uploaded_file.name
         st.session_state.last_model = model
         st.session_state.last_role = role
-
-        # =========================
-        # ✅ [추가] 단계 상태 업데이트
-        # =========================
-        step_status.success("✅ LLM 응답 수신 및 파싱 완료!")
 
 # ✅ 결과 렌더링
 if st.session_state.llm_result:
