@@ -4,6 +4,7 @@ import zipfile
 import tempfile
 import pandas as pd
 import requests
+from io import BytesIO  # ✅ [추가] 샘플 ZIP 메모리 생성에 필요
 
 # ✅ OpenRouter API KEY (보안 주의!)
 API_KEY = "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"
@@ -12,12 +13,43 @@ st.set_page_config(page_title="TC-Bot v3", layout="wide")
 st.title("🧪 TC-Bot v3: 테스트케이스 자동 생성기")
 
 # =========================
-# ✅ [수정] 샘플 ZIP 파일 로드 함수 (업로드된 실제 zip 사용)
+# ✅ [추가] 샘플코드 ZIP 생성 함수
 # =========================
-def _load_sample_zip() -> bytes:
-    sample_path = "/mnt/data/tc-bot-sample-code.zip"  # 업로드된 경로 고정
-    with open(sample_path, "rb") as f:
-        return f.read()
+def _build_sample_zip_bytes() -> bytes:
+    """
+    간단한 예제 소스 구조를 담은 ZIP을 메모리에서 생성하여 반환.
+    - README.md
+    - src/sample_app.py
+    - src/utils/helpers.py
+    """
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "README.md",
+            "# Sample Project for TC-Bot\n\n"
+            "This is a tiny sample to test TC extraction.\n"
+            "- Contains a trivial python app and helper.\n"
+            "- Upload this ZIP to see generated test cases.\n"
+        )
+        zf.writestr(
+            "src/sample_app.py",
+            'def add(a, b):\n'
+            '    """Return sum of a and b."""\n'
+            '    return a + b\n\n'
+            'def divide(a, b):\n'
+            '    """Divide a by b. Raises ZeroDivisionError if b==0."""\n'
+            '    return a / b\n\n'
+            'if __name__ == "__main__":\n'
+            '    print("OK")\n'
+        )
+        zf.writestr(
+            "src/utils/helpers.py",
+            'def normalize_username(name: str) -> str:\n'
+            '    """Trim and lower-case a username."""\n'
+            '    return (name or "").strip().lower()\n'
+        )
+    buf.seek(0)
+    return buf.read()
 
 # ✅ 사이드바 입력
 with st.sidebar:
@@ -26,17 +58,18 @@ with st.sidebar:
     role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
 
     # =========================
-    # ✅ [수정] 샘플 ZIP 다운로드 버튼
+    # ✅ [추가] 샘플 ZIP 다운로드 버튼
     # =========================
     st.markdown("---")
     st.subheader("📦 샘플 ZIP")
     st.caption("업로드용 예제 ZIP 파일이 필요하면 아래 버튼으로 받으세요.")
+    sample_zip_bytes = _build_sample_zip_bytes()
     st.download_button(
         "⬇️ 샘플코드 ZIP 다운로드",
-        data=_load_sample_zip(),
-        file_name="tc-bot-sample-code.zip",
+        data=sample_zip_bytes,
+        file_name="sample_project.zip",
         mime="application/zip",
-        help="업로드된 실제 샘플 ZIP 파일을 그대로 다운로드"
+        help="예제 프로젝트 ZIP (README 및 간단한 Python 코드 포함)"
     )
 
 # ✅ 세션 초기화
@@ -64,8 +97,11 @@ def need_llm_call(uploaded_file, model, role):
 
 # ✅ LLM 호출 조건 확인
 if uploaded_file and need_llm_call(uploaded_file, model, role):
-    preview_box = st.empty()
-    step_status = st.empty()
+    # =========================
+    # ✅ [추가] 진행상황/미리보기 플레이스홀더
+    # =========================
+    preview_box = st.empty()       # 미리보기 영역
+    step_status = st.empty()       # 단계별 상태 표시
 
     with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -77,7 +113,7 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
                 zip_ref.extractall(tmpdir)
 
             full_code = ""
-            file_list = []
+            file_list = []  # ✅ [추가] 미리보기용 파일 목록
             for root, _, files in os.walk(tmpdir):
                 for file in files:
                     if file.endswith(
@@ -95,6 +131,7 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
                         except:
                             continue
 
+        # ✅ Prompt 구성
         prompt = f"""
         너는 시니어 QA 엔지니어이며, 현재 '{role}' 역할을 맡고 있다.
         아래에 제공된 소스코드를 분석하여 기능 단위의 테스트 시나리오 기반 테스트케이스를 생성하라.
@@ -109,9 +146,13 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
         {full_code}
         """
 
-        # ✅ [유지] LLM 요청 미리보기
+        # =========================
+        # ✅ [추가] LLM 동작 중 미리보기 UI
+        #  - 업로드된 파일 목록 상위 30개 표시
+        #  - 실제로 전송될 프롬프트의 앞부분(최대 2000자) 미리보기
+        # =========================
         top_files = file_list[:30]
-        preview_prompt_head = prompt.strip()[:2000]
+        preview_prompt_head = prompt.strip()[:2000]  # 프롬프트 앞부분만
         with st.expander("🔎 LLM 요청 미리보기 (전송 전 확인)", expanded=True):
             st.markdown(f"**모델:** `{model}`  |  **역할:** `{role}`")
             if top_files:
@@ -137,6 +178,7 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
         result = response.json()["choices"][0]["message"]["content"]
         st.session_state.llm_result = result
 
+        # ✅ 결과 파싱
         rows = []
         for line in result.splitlines():
             if "|" in line and "TC" in line:
@@ -149,9 +191,14 @@ if uploaded_file and need_llm_call(uploaded_file, model, role):
                 rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
             st.session_state.parsed_df = df
 
+        # ✅ 세션 상태 업데이트
         st.session_state.last_uploaded_file = uploaded_file.name
         st.session_state.last_model = model
         st.session_state.last_role = role
+
+        # =========================
+        # ✅ [추가] 단계 상태 업데이트
+        # =========================
         step_status.success("✅ LLM 응답 수신 및 파싱 완료!")
 
 # ✅ 결과 렌더링
