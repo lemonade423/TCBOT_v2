@@ -235,12 +235,17 @@ def build_preview_testcases(stats):
 
 # 업로드되면, LLM 호출 조건과 상관없이 "미리보기"만 먼저 수행 (기존 로직에 영향 없음)
 if uploaded_file is not None:
+    # ▼▼▼ 수정: 업로드 파일을 '한 번만' 읽어서 재사용 ▼▼▼
+    zip_bytes = uploaded_file.getvalue()   # 스트림을 한 번만 소비
+    zip_name = uploaded_file.name
+    # ▲▲▲
+
     with tempfile.TemporaryDirectory() as tmpdir_preview:
         try:
-            # 업로드 ZIP 임시 저장/추출
-            zip_path = os.path.join(tmpdir_preview, uploaded_file.name)
+            # 업로드 ZIP 임시 저장/추출 (동일 바이트 재사용)
+            zip_path = os.path.join(tmpdir_preview, zip_name)
             with open(zip_path, "wb") as f:
-                f.write(uploaded_file.read())
+                f.write(zip_bytes)
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 zip_ref.extractall(tmpdir_preview)
 
@@ -272,12 +277,13 @@ if uploaded_file is not None:
 if uploaded_file and need_llm_call(uploaded_file, model, role):
     with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
         with tempfile.TemporaryDirectory() as tmpdir:
-            zip_path = os.path.join(tmpdir, uploaded_file.name)
+            # ▼▼▼ 수정: 미리 읽어둔 동일 바이트로 저장/추출 ▼▼▼
+            zip_path = os.path.join(tmpdir, zip_name)
             with open(zip_path, "wb") as f:
-                f.write(uploaded_file.read())
-
+                f.write(zip_bytes)
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(tmpdir)
+            # ▲▲▲
 
             full_code = ""
             for root, _, files in os.walk(tmpdir):
