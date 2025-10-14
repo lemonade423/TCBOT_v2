@@ -5,8 +5,8 @@ import tempfile
 import pandas as pd
 import requests
 import re
-# [ADD] Auto-Flow Preview & 샘플 ZIP 생성을 위해 in-memory 버퍼 사용
-import io  # ←(추가) 신규 기능 구현을 위한 최소한의 import
+# [ADD] 샘플 ZIP/엑셀 in-memory 생성을 위해 필요한 최소 import
+import io
 
 # ✅ OpenRouter API Key (보안을 위해 secrets.toml 또는 환경변수 사용 권장)
 API_KEY = st.secrets.get("OPENROUTER_API_KEY") or os.environ.get(
@@ -36,8 +36,7 @@ with st.sidebar:
     qa_role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
     st.session_state["qa_role"] = qa_role
 
-# [ADD] Auto-Flow Preview 탭 추가를 위한 탭 구성 변경 (기존 3개 → 4개)
-#  - 기존 탭들의 이름/순서/내부 로직은 변경 없음
+# [ADD] Auto-Flow Preview 탭 추가 (기존 3개 → 4개, 내부 로직 변경 없음)
 code_tab , tc_tab, log_tab, preview_tab = st.tabs(
     ["🧪 소스코드 → 테스트케이스 자동 생성","📑 테스트케이스 → 명세서 요약","🐞 에러 로그 → 재현 시나리오", "🧭 Auto-Flow Preview"] )
 
@@ -48,7 +47,7 @@ else:
     st.empty()
 
 # ────────────────────────────────────────────────
-# 🔧 유틸 함수: 에러 로그 전처리
+# 🔧 유틸 함수: 에러 로그 전처리 (기존 유지)
 # ────────────────────────────────────────────────
 MODEL_TOKEN_LIMITS = {
     "qwen/qwen-max": 30720,
@@ -101,11 +100,11 @@ def preprocess_log_text(text: str,
     }
     return trimmed, stats
 
+# ────────────────────────────────────────────────
 # [ADD] 샘플 데이터 생성 유틸 (신규 기능 전용, 기존 흐름 영향 없음)
+# ────────────────────────────────────────────────
 def build_sample_code_zip() -> bytes:
-    """
-    간단한 3개 파일로 구성된 샘플 코드 ZIP (테스트케이스 자동 생성 입력용)
-    """
+    """간단한 3개 파일로 구성된 샘플 코드 ZIP (테스트케이스 자동 생성 입력용)"""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("app.py",
@@ -126,11 +125,9 @@ def build_sample_code_zip() -> bytes:
                     "- 단순 산술/검증 로직으로 테스트케이스 생성 시연용")
     return buf.getvalue()
 
-
+# [FIX] 환경 요구사항에 맞춰 엑셀 엔진을 openpyxl 로 고정 (requirements.txt에 openpyxl 포함)
 def build_sample_tc_excel() -> bytes:
-    """
-    Tab1/Tab2에서 공통으로 내려주는 '테스트케이스.xlsx' 샘플 (명세서 요약 입력으로 사용 가능)
-    """
+    """샘플 테스트케이스 XLSX (openpyxl 엔진 사용)"""
     df = pd.DataFrame([
         ["TC-001", "덧셈 기능", "a=1, b=2", "3 반환", "High"],
         ["TC-002", "나눗셈 기능(정상)", "a=6, b=3", "2 반환", "Medium"],
@@ -138,10 +135,10 @@ def build_sample_tc_excel() -> bytes:
         ["TC-004", "이메일 검증(정상)", "s='user@example.com'", "True 반환", "Low"],
         ["TC-005", "이메일 검증(이상)", "s='invalid@domain'", "False 또는 규칙 위반 처리", "Low"],
     ], columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
-    with io.BytesIO() as bio:
-        with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="테스트케이스")
-        return bio.getvalue()
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="테스트케이스")
+    return bio.getvalue()
 
 # ────────────────────────────────────────────────
 # 🧪 TAB 1: 소스코드 → 테스트케이스 자동 생성기
@@ -249,8 +246,9 @@ with code_tab:
 
     if st.session_state.parsed_df is not None and not need_llm_call(
             uploaded_file, model, qa_role):
+        # (기존 방식 유지) NamedTemporaryFile로 엑셀 저장
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-            st.session_state.parsed_df.to_excel(tmp.name, index=False)
+            st.session_state.parsed_df.to_excel(tmp.name, index=False)  # openpyxl 사용
             tmp.seek(0)
             st.download_button("⬇️ 엑셀 다운로드",
                                data=tmp.read(),
@@ -284,7 +282,7 @@ with tc_tab:
                 if tc_file.name.endswith("csv"):
                     df = pd.read_csv(tc_file)
                 else:
-                    df = pd.read_excel(tc_file)
+                    df = pd.read_excel(tc_file)  # openpyxl 사용
             except Exception as e:
                 st.session_state["is_loading"] = False
                 st.error(f"❌ 파일 읽기 실패: {e}")
@@ -341,7 +339,7 @@ with tc_tab:
 with log_tab:
     st.subheader("🐞 에러 로그 기반 재현 시나리오 생성기")
 
-    # ✅ 샘플 에러 로그 다운로드 버튼 추가
+    # ✅ 샘플 에러 로그 다운로드 버튼 추가(기존 동작 영향 없음)
     sample_log = """[InstallShield Silent]
     Version=v7.00
     File=Log File
@@ -355,11 +353,11 @@ with log_tab:
     """
 
     st.download_button(
-    "⬇️ 샘플 에러 로그 다운로드",
-    data=sample_log,
-    file_name="sample_error_log.log",
-    disabled=st.session_state["is_loading"]
-)
+        "⬇️ 샘플 에러 로그 다운로드",
+        data=sample_log,
+        file_name="sample_error_log.log",
+        disabled=st.session_state["is_loading"]
+    )
 
     log_file = st.file_uploader("📂 에러 로그 파일 업로드 (.log, .txt)",
                                 type=["log", "txt"],
@@ -409,8 +407,7 @@ with log_tab:
                     timeout=120,
                 )
                 if response.status_code == 200:
-                    content = response.json(
-                    )["choices"][0]["message"]["content"]
+                    content = response.json()["choices"][0]["message"]["content"]
                     st.session_state.scenario_result = content
                 else:
                     st.error("❌ LLM 호출 실패")
@@ -479,7 +476,7 @@ with preview_tab:
             if tc_prev.name.endswith("csv"):
                 dfp = pd.read_csv(tc_prev)
             else:
-                dfp = pd.read_excel(tc_prev)
+                dfp = pd.read_excel(tc_prev)  # openpyxl 사용
             st.write("행/열:", dfp.shape)
             st.dataframe(dfp.head(20))
             required_cols = ["TC ID", "기능 설명", "입력값", "예상 결과"]
