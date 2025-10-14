@@ -5,8 +5,9 @@ import tempfile
 import pandas as pd
 import requests
 import re
-# [ADD] 미리보기/샘플 ZIP 생성을 위한 in-memory 버퍼
+# [ADD] 미리보기/샘플 생성용
 import io
+from collections import Counter
 
 # ✅ OpenRouter API Key (보안을 위해 secrets.toml 또는 환경변수 사용 권장)
 API_KEY = st.secrets.get("OPENROUTER_API_KEY") or os.environ.get(
@@ -36,7 +37,7 @@ with st.sidebar:
     qa_role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
     st.session_state["qa_role"] = qa_role
 
-# [FIX] 미리보기 전용 탭 제거(요구사항2) → 기존 3개 탭만 유지
+# ✅ 기존 3개 탭 유지 (요구사항에 따라 별도 탭 추가/삭제 없음)
 code_tab , tc_tab, log_tab = st.tabs(
     ["🧪 소스코드 → 테스트케이스 자동 생성","📑 테스트케이스 → 명세서 요약","🐞 에러 로그 → 재현 시나리오"] )
 
@@ -101,7 +102,7 @@ def preprocess_log_text(text: str,
     return trimmed, stats
 
 # ────────────────────────────────────────────────
-# [ADD] 샘플 코드 ZIP 생성(기존 흐름 영향 없음)
+# [ADD] 샘플 파일 생성 & 결과 미리보기(휴리스틱) 유틸
 # ────────────────────────────────────────────────
 def build_sample_code_zip() -> bytes:
     """간단한 3개 파일로 구성된 샘플 코드 ZIP (테스트케이스 자동 생성 입력용)"""
@@ -124,6 +125,106 @@ def build_sample_code_zip() -> bytes:
                     "- add(a,b), div(a,b), is_email(s) 함수 포함\n"
                     "- 단순 산술/검증 로직으로 테스트케이스 생성 시연용")
     return buf.getvalue()
+
+# [ADD] Tab2용: 샘플 테스트케이스 XLSX (요구사항: Tab2에 필요)
+def build_sample_tc_excel() -> bytes:
+    df = pd.DataFrame([
+        ["TC-001", "덧셈 기능", "a=1, b=2", "3 반환", "High"],
+        ["TC-002", "나눗셈 기능(정상)", "a=6, b=3", "2 반환", "Medium"],
+        ["TC-003", "나눗셈 기능(예외)", "a=1, b=0", "ZeroDivisionError 발생", "High"],
+        ["TC-004", "이메일 검증(정상)", "s='user@example.com'", "True 반환", "Low"],
+        ["TC-005", "이메일 검증(이상)", "s='invalid@domain'", "False 또는 규칙 위반 처리", "Low"],
+    ], columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="테스트케이스")
+    return bio.getvalue()
+
+# [ADD] 결과 미리보기(휴리스틱) - Tab1: 코드 ZIP → TC 프리뷰 3건
+def analyze_code_zip(zip_bytes: bytes) -> dict:
+    lang_map = {
+        ".py": "Python", ".java": "Java", ".js": "JS", ".ts": "TS",
+        ".cpp": "CPP", ".c": "C", ".cs": "CS"
+    }
+    lang_counts = Counter()
+    top_functions = []
+    total_files = 0
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            names = zf.namelist()
+            total_files = len(names)
+            for n in names:
+                ext = os.path.splitext(n)[1].lower()
+                if ext in lang_map:
+                    lang_counts[lang_map[ext]] += 1
+                    # 간단 함수/메서드 시그니처 추출(상위 20KB만)
+                    try:
+                        with zf.open(n) as fh:
+                            content = fh.read(20480).decode("utf-8", errors="ignore")
+                            # 파이썬/JS/TS/Java 계열 간단 정규식
+                            for pat in [
+                                r"def\s+([a-zA-Z_]\w*)\s*\(",
+                                r"function\s+([a-zA-Z_]\w*)\s*\(",
+                                r"(?:public|private|protected)?\s*(?:static\s+)?[A-Za-z_<>\[\]]+\s+([a-zA-Z_]\w*)\s*\("
+                            ]:
+                                top_functions += re.findall(pat, content)
+                    except Exception:
+                        pass
+    except zipfile.BadZipFile:
+        pass
+
+    return {
+        "total_files": total_files,
+        "lang_counts": lang_counts,
+        "top_functions": top_functions[:10]
+    }
+
+def build_preview_testcases(stats: dict) -> pd.DataFrame:
+    # 휴리스틱 기반 결과 미리보기(3건)
+    rows = []
+    if stats["lang_counts"]:
+        lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
+    else:
+        lang_str = "감지된 언어 없음"
+    rows.append(["TC-PV-001", "언어 혼합 프로젝트 로딩", f"언어분포: {lang_str}", "모든 파일 파싱 성공", "High"])
+    if stats["top_functions"]:
+        fn = stats["top_functions"][0]
+        rows.append(["TC-PV-002", f"핵심 함수/엔드포인트 동작 검증({fn})", "유효/무효 입력 2세트", "정상/에러 응답 구분", "High"])
+    else:
+        rows.append(["TC-PV-002", "엔드포인트/함수 미검출 시 기본 동작", "기본 실행", "에러 없이 앱 부팅", "Medium"])
+    rows.append(["TC-PV-003", "대상 코드 범위 커버리지 초기 점검", f"파일 수={stats['total_files']}", "주요 모듈별 1개 이상 케이스 존재", "Medium"])
+    return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
+
+# [ADD] 결과 미리보기(휴리스틱) - Tab2: TC → 명세서 요약 프리뷰
+def build_preview_spec(df: pd.DataFrame, summary_type: str) -> str:
+    # 간단 규칙: 기능/요구사항 제목 후보 2~3개 생성
+    titles = []
+    if "기능 설명" in df.columns:
+        titles = list(pd.Series(df["기능 설명"]).dropna().astype(str).head(3).unique())
+    elif "TC ID" in df.columns:
+        titles = [f"{summary_type} 기반: {str(df['TC ID'].iloc[i])}" for i in range(min(3, len(df)))]
+
+    if not titles:
+        titles = [f"{summary_type} 초안 항목"]
+
+    lines = []
+    for t in titles:
+        lines.append(f"- **{t}**\n  - 설명: 입력/예상결과를 기준으로 동작 목적과 예외처리를 요약합니다.\n  - 기대 효과: 기능 명확화, 경계값 확인, 회귀 테스트 기반 확보.")
+    return "\n".join(lines)
+
+# [ADD] 결과 미리보기(휴리스틱) - Tab3: 로그 → 시나리오 초안 프리뷰
+def build_preview_scenario(raw_log: str) -> str:
+    sev_hits = re.findall(r"(ERROR|Exception|WARN|FATAL)", raw_log, flags=re.IGNORECASE)
+    sev_stat = Counter([s.upper() for s in sev_hits])
+    top = sev_stat.most_common(1)[0][0] if sev_stat else "INFO"
+    return (
+        "1. 시나리오 제목: 초기 재현 시도 (로그 패턴 기반)\n"
+        f"2. 전제 조건: 로그 심각도 분포 {dict(sev_stat)}\n"
+        "3. 테스트 입력값: 최소 재현 입력(최근 에러 직전 단계)\n"
+        "4. 재현 절차: 에러 유발 직전 흐름 추적 → 동일 환경/버전에서 단계 수행\n"
+        f"5. 기대 결과: {top} 레벨 이벤트 재현 및 추가 진단 정보 확보"
+    )
 
 # ────────────────────────────────────────────────
 # 🧪 TAB 1: 소스코드 → 테스트케이스 자동 생성기
@@ -151,35 +252,20 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # [ADD] 요구2: LLM 실행 전 미리보기(해당 탭에서 표시)
+    # [ADD] 결과 미리보기(휴리스틱): 업로드 시 즉시 표시
     code_bytes = None
     if uploaded_file:
-        code_bytes = uploaded_file.getvalue()  # 이후 LLM 처리에서도 재사용
-        try:
-            with zipfile.ZipFile(io.BytesIO(code_bytes), "r") as zf:
-                file_list = zf.namelist()
-                src_list = [f for f in file_list if f.endswith((".py",".java",".js",".ts",".cpp",".c",".cs"))]
-                with st.expander("👀 업로드 ZIP 미리보기", expanded=True):
-                    st.write(f"- 파일 수: **{len(file_list)}**  ·  소스 코드 파일 수: **{len(src_list)}**")
-                    if src_list:
-                        st.write("샘플(상위 5개 경로):")
-                        st.code("\n".join(src_list[:5]), language="bash")
-                        sel = src_list[0]
-                        with zf.open(sel) as fh:
-                            snippet = fh.read().decode("utf-8", errors="ignore")
-                            st.markdown(f"**스니펫:** `{sel}` (상위 80줄)")
-                            st.code("\n".join(snippet.splitlines()[:80]) or "(빈 파일)", language="python")
-                    else:
-                        st.warning("소스 코드 확장자(.py/.java/.js/.ts/.cpp/.c/.cs)가 감지되지 않았습니다.")
-        except zipfile.BadZipFile:
-            st.error("ZIP 형식이 올바르지 않습니다.")
+        code_bytes = uploaded_file.getvalue()
+        stats = analyze_code_zip(code_bytes)
+        with st.expander("🔮 결과 미리보기(휴리스틱: 테스트케이스 3건)", expanded=True):
+            pv_df = build_preview_testcases(stats)
+            st.dataframe(pv_df, use_container_width=True)
 
     if uploaded_file and need_llm_call(uploaded_file, model, qa_role):
         st.session_state["is_loading"] = True
         with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
             with tempfile.TemporaryDirectory() as tmpdir:
                 zip_path = os.path.join(tmpdir, uploaded_file.name)
-                # [FIX] 미리보기에서 읽은 바이트 재사용(업로드 객체 재읽기 방지)
                 with open(zip_path, "wb") as f:
                     f.write(code_bytes if code_bytes is not None else uploaded_file.read())
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -260,7 +346,13 @@ with code_tab:
 with tc_tab:
     st.subheader("📑 테스트케이스 기반 기능/요구사항 명세서 추출기")
 
-    # [FIX] 요구1에 따라 Tab1만 버튼 제거, Tab2는 기존대로 동작(추가 버튼 없음)
+    # [ADD] 요구사항: Tab2에 샘플 테스트케이스 엑셀 다운로드 제공
+    st.download_button(
+        "⬇️ 샘플 테스트케이스 엑셀 다운로드",
+        data=build_sample_tc_excel(),
+        file_name="테스트케이스_샘플.xlsx",
+        help="필수 컬럼( TC ID, 기능 설명, 입력값, 예상 결과, 우선순위 ) 포함"
+    )
 
     tc_file = st.file_uploader("📂 테스트케이스 파일 업로드 (.xlsx, .csv)",
                                type=["xlsx", "csv"],
@@ -271,7 +363,7 @@ with tc_tab:
     if st.button("🚀 명세서 생성하기", disabled=st.session_state["is_loading"]) and tc_file:
         st.session_state["is_loading"] = True
 
-        # [ADD] 요구2: LLM 실행 전 미리보기(해당 탭에서 표시)
+        # [FIX] 원래 로직 유지 + [ADD] 결과 미리보기(휴리스틱)
         try:
             if tc_file.name.endswith("csv"):
                 df = pd.read_csv(tc_file)
@@ -282,23 +374,9 @@ with tc_tab:
             st.error(f"❌ 파일 읽기 실패: {e}")
             st.stop()
 
-        with st.expander("👀 테스트케이스 미리보기", expanded=True):
-            st.write("행/열:", df.shape)
-            st.dataframe(df.head(20))
-            required_cols = ["TC ID", "기능 설명", "입력값", "예상 결과"]
-            missing = [c for c in required_cols if c not in df.columns]
-            if missing:
-                st.warning("필수 컬럼 누락: " + ", ".join(missing))
-            else:
-                st.success("필수 컬럼 확인 완료")
-            # 간단 분석
-            if "TC ID" in df.columns:
-                dup_cnt = df["TC ID"].duplicated().sum()
-                if dup_cnt:
-                    st.warning(f"중복된 TC ID {dup_cnt}건 감지")
-            if "우선순위" in df.columns:
-                dist = df["우선순위"].value_counts(dropna=False).to_dict()
-                st.info("우선순위 분포: " + ", ".join([f"{k}:{v}" for k,v in dist.items()]))
+        with st.expander("🔮 결과 미리보기(휴리스틱: 요약 초안)", expanded=True):
+            pv_text = build_preview_spec(df, summary_type)
+            st.markdown(pv_text)
 
         with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
             required_cols = ["TC ID", "기능 설명", "입력값", "예상 결과"]
@@ -379,18 +457,12 @@ with log_tab:
     if not API_KEY:
         st.warning("🔐 OpenRouter API Key가 설정되지 않았습니다.")
 
-    # [ADD] 요구2: LLM 실행 전 로그 미리보기(해당 탭에서 표시)
     raw_log_cache = None
     if log_file:
         raw_log_cache = log_file.read().decode("utf-8", errors="ignore")
-        with st.expander("👀 로그 미리보기", expanded=True):
-            st.write(f"- 총 문자 수: **{len(raw_log_cache):,}**")
-            patt = re.compile(r"(ERROR|Exception|WARN|FATAL)", re.IGNORECASE)
-            hits = len(patt.findall(raw_log_cache))
-            st.info(f"심각도 키워드 감지 개수: {hits}")
-            # 원본 상위 80줄
-            st.markdown("**원본 스니펫 (상위 80줄):**")
-            st.code("\n".join(raw_log_cache.splitlines()[:80]) or "(빈 파일)", language="text")
+        # [ADD] 결과 미리보기(휴리스틱): 재현 시나리오 골격
+        with st.expander("🔮 결과 미리보기(휴리스틱: 시나리오 골격)", expanded=True):
+            st.markdown(build_preview_scenario(raw_log_cache))
 
     if st.button("🚀 시나리오 생성하기", disabled=st.session_state["is_loading"]) and raw_log_cache:
         st.session_state["is_loading"] = True
