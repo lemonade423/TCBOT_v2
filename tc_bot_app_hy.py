@@ -37,7 +37,7 @@ with st.sidebar:
     qa_role = st.selectbox("👤 QA 역할", ["기능 QA", "보안 QA", "성능 QA"])
     st.session_state["qa_role"] = qa_role
 
-# ✅ 기존 3개 탭 유지 (요구사항에 따라 별도 탭 추가/삭제 없음)
+# ✅ 기존 3개 탭 유지
 code_tab , tc_tab, log_tab = st.tabs(
     ["🧪 소스코드 → 테스트케이스 자동 생성","📑 테스트케이스 → 명세서 요약","🐞 에러 로그 → 재현 시나리오"] )
 
@@ -140,7 +140,7 @@ def build_sample_tc_excel() -> bytes:
         df.to_excel(writer, index=False, sheet_name="테스트케이스")
     return bio.getvalue()
 
-# [ADD] 결과 미리보기(휴리스틱) - Tab1: 코드 ZIP → TC 프리뷰 3건
+# [ADD] 결과 미리보기(휴리스틱) - Tab1: 코드 ZIP → 통계 + TC 프리뷰 3건
 def analyze_code_zip(zip_bytes: bytes) -> dict:
     lang_map = {
         ".py": "Python", ".java": "Java", ".js": "JS", ".ts": "TS",
@@ -162,7 +162,6 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
                     try:
                         with zf.open(n) as fh:
                             content = fh.read(20480).decode("utf-8", errors="ignore")
-                            # 파이썬/JS/TS/Java 계열 간단 정규식
                             for pat in [
                                 r"def\s+([a-zA-Z_]\w*)\s*\(",
                                 r"function\s+([a-zA-Z_]\w*)\s*\(",
@@ -177,8 +176,18 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
     return {
         "total_files": total_files,
         "lang_counts": lang_counts,
-        "top_functions": top_functions[:10]
+        "top_functions": top_functions[:50]  # 상한
     }
+
+# [ADD] 예상 테스트케이스 개수 추정(간단 휴리스틱)
+def estimate_tc_count(stats: dict) -> int:
+    # 기준: 파일 수·언어 수·탐지된 함수 수를 가중합 (최소 3건 보장)
+    files = max(0, stats.get("total_files", 0))
+    langs = sum(stats.get("lang_counts", Counter()).values())
+    funcs = len(stats.get("top_functions", []))
+    # 가중치: 파일 0.3, 언어 0.7, 함수 0.9 -> 대략적인 볼륨 추정
+    estimate = int(files * 0.3 + langs * 0.7 + funcs * 0.9)
+    return max(3, min(estimate, 300))  # 과도한 값 상한
 
 def build_preview_testcases(stats: dict) -> pd.DataFrame:
     # 휴리스틱 기반 결과 미리보기(3건)
@@ -232,7 +241,7 @@ def build_preview_scenario(raw_log: str) -> str:
 with code_tab:
     st.subheader("🧪 소스코드 기반 테스트케이스 자동 생성기")
 
-    # [FIX] 요구1: 샘플 테스트케이스 엑셀 버튼 제거, 샘플 코드 ZIP만 유지
+    # (유지) 샘플 테스트케이스 엑셀 버튼 없음. 샘플 코드 ZIP만 제공.
     st.download_button(
         "⬇️ 샘플 코드 ZIP 다운로드",
         data=build_sample_code_zip(),
@@ -252,11 +261,30 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # [ADD] 결과 미리보기(휴리스틱): 업로드 시 즉시 표시
+    # [ADD] 강화된 결과 미리보기(휴리스틱): 업로드 즉시 "요약 + 3건 프리뷰"
     code_bytes = None
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
         stats = analyze_code_zip(code_bytes)
+
+        # ── 요약 정보 블록: 파일 수 / 언어 / 함수·엔드포인트 / 예상 TC 개수
+        with st.expander("📊 결과 요약(휴리스틱)", expanded=True):
+            # 언어 분포 문자열
+            if stats["lang_counts"]:
+                lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
+            else:
+                lang_str = "감지된 언어 없음"
+            funcs_cnt = len(stats["top_functions"])
+            expected_tc = estimate_tc_count(stats)
+
+            st.markdown(
+                f"- **파일 수**: {stats['total_files']}\n"
+                f"- **언어 분포**: {lang_str}\n"
+                f"- **함수/엔드포인트 수(추정)**: {funcs_cnt}\n"
+                f"- **예상 테스트케이스 개수(추정)**: {expected_tc}"
+            )
+
+        # ── 휴리스틱 미리보기 3건 표
         with st.expander("🔮 결과 미리보기(휴리스틱: 테스트케이스 3건)", expanded=True):
             pv_df = build_preview_testcases(stats)
             st.dataframe(pv_df, use_container_width=True)
@@ -346,7 +374,7 @@ with code_tab:
 with tc_tab:
     st.subheader("📑 테스트케이스 기반 기능/요구사항 명세서 추출기")
 
-    # [ADD] 요구사항: Tab2에 샘플 테스트케이스 엑셀 다운로드 제공
+    # (요구사항) Tab2에 샘플 테스트케이스 엑셀 다운로드 제공
     st.download_button(
         "⬇️ 샘플 테스트케이스 엑셀 다운로드",
         data=build_sample_tc_excel(),
@@ -363,7 +391,7 @@ with tc_tab:
     if st.button("🚀 명세서 생성하기", disabled=st.session_state["is_loading"]) and tc_file:
         st.session_state["is_loading"] = True
 
-        # [FIX] 원래 로직 유지 + [ADD] 결과 미리보기(휴리스틱)
+        # (유지) 원래 로직 + (유지) 결과 미리보기(휴리스틱)
         try:
             if tc_file.name.endswith("csv"):
                 df = pd.read_csv(tc_file)
@@ -460,7 +488,7 @@ with log_tab:
     raw_log_cache = None
     if log_file:
         raw_log_cache = log_file.read().decode("utf-8", errors="ignore")
-        # [ADD] 결과 미리보기(휴리스틱): 재현 시나리오 골격
+        # (유지) 결과 미리보기(휴리스틱): 재현 시나리오 골격
         with st.expander("🔮 결과 미리보기(휴리스틱: 시나리오 골격)", expanded=True):
             st.markdown(build_preview_scenario(raw_log_cache))
 
