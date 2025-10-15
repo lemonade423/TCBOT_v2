@@ -7,7 +7,8 @@ import requests
 import re
 # [ADD] 유틸/미리보기/엑셀용
 import io
-from collections import Counter
+from collections import Counter, defaultdict
+from hashlib import sha1
 
 # ✅ OpenRouter API Key (보안을 위해 secrets.toml 또는 환경변수 사용 권장)
 API_KEY = st.secrets.get("OPENROUTER_API_KEY") or os.environ.get(
@@ -106,7 +107,7 @@ def preprocess_log_text(text: str,
     return trimmed, stats
 
 # ────────────────────────────────────────────────
-# [ADD] 샘플 파일/샘플 TC 엑셀 빌더 (기존 요구 유지)
+# [ADD] 샘플 파일/샘플 TC 엑셀 빌더 (기존 유지)
 # ────────────────────────────────────────────────
 def build_sample_code_zip() -> bytes:
     buf = io.BytesIO()
@@ -199,7 +200,7 @@ def estimate_tc_count(stats: dict) -> int:
     return max(3, min(estimate, 300))
 
 # ────────────────────────────────────────────────
-# [ADD] LLM 결과 포맷(핵심): **기능별 테이블 분리 + 그룹별 TC ID 재넘버링 + 엑셀 시트 분리**
+# [ADD] LLM 결과 포맷(핵심): 기능별 테이블 분리 + 그룹별 TC ID 재넘버링 + 엑셀 시트 분리
 # ────────────────────────────────────────────────
 
 # [ADD] 코드펜스 제거(테이블 파싱 방해 방지)
@@ -208,10 +209,6 @@ def _strip_code_fences(md: str) -> str:
 
 # [ADD] 마크다운 테이블 + 직전 헤딩 매핑 추출
 def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]]:
-    """
-    [핵심] 문서에서 마크다운 테이블을 모두 찾고, 각 테이블에 대해
-    바로 위(최대 5줄 이내)의 섹션 헤딩(##, ### 등) 또는 굵은 텍스트를 기능명으로 매핑.
-    """
     text = _strip_code_fences(md_text)
     lines = text.splitlines()
     tables = []
@@ -220,30 +217,20 @@ def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]
         header = lines[i].strip()
         sep = lines[i + 1].strip() if i + 1 < len(lines) else ""
         if "|" in header and re.search(r"\|\s*:?-{2,}\s*\|", sep):
-            # ↑ 표 시작 감지
-            # ➊ 기능명 후보: 직전 1~5줄에서 헤딩/굵은 텍스트/라벨 추출
             feature_name = ""
             for back in range(1, 6):
                 if i - back < 0:
                     break
                 prev = lines[i - back].strip()
-                # 헤딩 패턴
                 m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", prev)
                 if m:
-                    feature_name = m.group(1)
-                    break
-                # 굵은 텍스트 라벨(예: **Alarm Manager**)
+                    feature_name = m.group(1); break
                 m2 = re.match(r"^\s{0,3}\*\*(.+?)\*\*\s*$", prev)
                 if m2:
-                    feature_name = m2.group(1)
-                    break
-                # '기능: XXX' 라벨
+                    feature_name = m2.group(1); break
                 m3 = re.match(r"^\s*(기능|Feature)\s*[:：]\s*(.+?)\s*$", prev, flags=re.IGNORECASE)
                 if m3:
-                    feature_name = m3.group(2)
-                    break
-
-            # ➋ 테이블 바디 수집
+                    feature_name = m3.group(2); break
             j = i + 2
             rows = [header, sep]
             while j < len(lines):
@@ -252,7 +239,6 @@ def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]
                     break
                 rows.append(cur)
                 j += 1
-
             df = _md_table_to_df("\n".join(rows))
             if df is not None and len(df.columns) >= 3:
                 tables.append((feature_name, df))
@@ -261,7 +247,6 @@ def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]
             i += 1
     return tables
 
-# [ADD] 간단 마크다운 테이블→DataFrame
 def _md_table_to_df(table_str: str) -> pd.DataFrame | None:
     raw = [r for r in table_str.splitlines() if r.strip()]
     if len(raw) < 2:
@@ -280,7 +265,6 @@ def _md_table_to_df(table_str: str) -> pd.DataFrame | None:
         return None
     return pd.DataFrame(rows, columns=headers)
 
-# [ADD] 헤더 표준화
 def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     header_map = {
         "TC ID":"TC ID","TCID":"TC ID","ID":"TC ID","케이스ID":"TC ID",
@@ -295,70 +279,83 @@ def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
         if key:
             new_cols[c] = key
     df2 = df.rename(columns=new_cols)
-    # 최소 칼럼 보장
     for c in ["TC ID","기능 설명","입력값","예상 결과","우선순위"]:
         if c not in df2.columns:
             df2[c] = ""
     return df2[["TC ID","기능 설명","입력값","예상 결과","우선순위"]]
 
 # [ADD] 기능 키 정규화(시트명/ID용)
-def _normalize_feature_key(name: str, sample_row: dict | None = None) -> str:
+def _normalize_feature_key(name: str, sample_row: dict | None = None) -> tuple[str,str]:
     key = (name or "").strip()
-    if not key:
-        # TC ID/기능설명에서 보조 추출
-        if sample_row:
-            tcid = str(sample_row.get("TC ID",""))
-            feat = str(sample_row.get("기능 설명",""))
-            m = re.match(r"(?i)TC[-_]?([A-Za-z0-9]+)", tcid)
-            if m and m.group(1) and not m.group(1).isdigit():
-                key = m.group(1)
-            if not key:
-                tks = re.findall(r"[A-Za-z][A-Za-z0-9]+", feat)
-                if tks:
-                    key = "".join(tks[:2])
+    if not key and sample_row:
+        tcid = str(sample_row.get("TC ID",""))
+        feat = str(sample_row.get("기능 설명",""))
+        m = re.match(r"(?i)TC[-_]?([A-Za-z0-9]+)", tcid)
+        if m and m.group(1) and not m.group(1).isdigit():
+            key = m.group(1)
+        if not key:
+            tks = re.findall(r"[A-Za-z][A-Za-z0-9]+", feat)
+            if tks:
+                key = "".join(tks[:2])
     key = key or "General"
-    key = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key).strip()
-    # ID 접두용은 소문자/영숫자만, 공백→하이픈
-    key_id = re.sub(r"[^A-Za-z0-9 ]", "", key).strip().lower().replace(" ", "-") or "general"
-    return key, key_id
+    sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key).strip()
+    key_id = re.sub(r"[^A-Za-z0-9 ]", "", sheet).strip().lower().replace(" ", "-") or "general"
+    return sheet, key_id
 
-# [ADD] 핵심: 기능별 그룹핑(테이블 경계 보존) + 그룹 내 tc-<key>-NNN 재부여
+# [ADD] TCID 접두 추출 (예: TC-AlarmMgr-001 → 'alarmmgr')
+def _extract_prefix_from_tcid(tcid: str) -> str | None:
+    m = re.match(r"(?i)^TC[-_]?([A-Za-z][A-Za-z0-9]+)-\d{2,4}$", str(tcid).strip())
+    if m:
+        return m.group(1).lower()
+    return None
+
+# [ADD] 기능 키 추정(단일 DF 강제 분리용): TCID 접두→기능설명 키워드→Fallback
+def _infer_key_from_row(row: pd.Series) -> str:
+    tcid = str(row.get("TC ID",""))
+    feat = str(row.get("기능 설명",""))
+    pref = _extract_prefix_from_tcid(tcid)
+    if pref:
+        return pref
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9]+", feat)
+    if tokens:
+        return "-".join(tokens[:2]).lower()
+    return "general"
+
+# [ADD] 단일 DF → 기능별 분리
+def split_single_df(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    df2 = _normalize_headers(df).fillna("")
+    df2["_k_"] = df2.apply(_infer_key_from_row, axis=1)
+    groups = {}
+    for k, sub in df2.groupby("_k_"):
+        sub = sub.drop(columns=["_k_"]).reset_index(drop=True)
+        sheet, key_id = _normalize_feature_key(k, sub.iloc[0].to_dict() if len(sub) else None)
+        sub["TC ID"] = [f"tc-{key_id}-{i:03d}" for i in range(1, len(sub)+1)]
+        groups[sheet[:31] or "General"] = sub
+    return groups
+
+# [ADD] 핵심: 문서 전체 → 기능별 그룹핑(테이블 경계 보존) + 그룹 내 tc-<key>-NNN 재부여
 def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
-    """
-    요구사항 구현:
-    - LLM이 기능별로 표를 나눠주면: 각 표를 기능으로 간주(직전 헤딩/라벨 기준).
-    - 표가 하나만 와도: 기능명을 비워둘 수 있으므로 보조 규칙으로 키 산출.
-    - 각 기능 그룹마다 TC ID는 'tc-<key>-NNN'(001부터)로 **재부여**.
-    - 반환: {sheet_name: DataFrame}
-    """
     tbls = _parse_md_tables_with_heading(md_text)
     if not tbls:
         return {}
-
+    # 1) 헤딩 존재/부재에 관계없이, 표 단위로 우선 분리
     groups: dict[str, pd.DataFrame] = {}
     unnamed_count = 0
-
     for (heading, df) in tbls:
         df_norm = _normalize_headers(df).fillna("")
-        # 기능명/키 생성
         sample_row = df_norm.iloc[0].to_dict() if len(df_norm) else {}
         sheet_name, key_id = _normalize_feature_key(heading, sample_row)
         if not heading:
             unnamed_count += 1
-            # 같은 'General'이 반복될 수 있어 시트명 유니크 처리
             sheet_name = f"{sheet_name}-{unnamed_count}"
-        # 그룹 내 넘버링: 001부터
-        df_g = df_norm.copy()
-        df_g["TC ID"] = [f"tc-{key_id}-{i:03d}" for i in range(1, len(df_g)+1)]
-        # 같은 시트명이 이미 있다면 뒤에 -2, -3 … 부여
+        df_norm["TC ID"] = [f"tc-{key_id}-{i:03d}" for i in range(1, len(df_norm)+1)]
         final_name = sheet_name[:31] if len(sheet_name) > 31 else sheet_name
         cnt = 2
         while final_name in groups:
             candidate = (sheet_name[:27] + f"-{cnt}") if len(sheet_name) > 27 else f"{sheet_name}-{cnt}"
             final_name = candidate[:31]
             cnt += 1
-        groups[final_name] = df_g
-
+        groups[final_name] = df_norm
     return groups
 
 # [ADD] 화면 표시용(결합 표): 보기 편하도록 기능컬럼 추가해 합쳐서 보여줌
@@ -373,7 +370,7 @@ def concat_groups_for_view(groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(view_rows, ignore_index=True)[["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"]]
 
 # ────────────────────────────────────────────────
-# [ADD] Auto-Preview(Sample TC) — 기존 유지 (요구 외 변경 없음)
+# [FIX] Auto-Preview(Sample TC) 생성기 — 다양성/중복방지 강화
 # ────────────────────────────────────────────────
 def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     stop = {
@@ -382,9 +379,7 @@ def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
         "test","temp","main","init","start","stop","open","close","send","receive","retry","download","upload","save","add","sum","plus","div","divide"
     }
     s = re.sub(r"([a-z])([A-Z])", r"\1 \2", fn).replace("_"," ")
-    words = [w for w in re.findall(r"[A-Za-z]+", s) if w.lower() not in stop]
-    if not words:
-        words = re.findall(r"[A-Za-z]+", s)[:2]
+    words = [w for w in re.findall(r"[A-Za-z]+", s) if w.lower() not in stop] or re.findall(r"[A-Za-z]+", s)[:2]
     base = "".join(w.capitalize() for w in words[:3])
     base = re.sub(r"[^A-Za-z0-9]", "", base) or "Auto"
     n = 1 if seq is None else seq
@@ -395,56 +390,141 @@ def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     used_ids.add(tcid)
     return tcid
 
-
+# [FIX] 템플릿 다양화 + 결정적 변이(해시) + 중복방지 + 구체 입력/결과
 def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
+    # 분류
     def classify(fn: str) -> str:
         s = fn.lower()
         if any(k in s for k in ["add","sum","plus"]): return "add"
         if any(k in s for k in ["div","divide"]): return "div"
-        if any(k in s for k in ["get","fetch","load","read"]): return "read"
-        if any(k in s for k in ["save","create","update","insert","post","put"]): return "write"
+        if any(k in s for k in ["get","fetch","load","read","list","find"]): return "read"
+        if any(k in s for k in ["save","create","update","insert","post","put","patch"]): return "write"
         if any(k in s for k in ["delete","remove"]): return "delete"
-        if any(k in s for k in ["auth","login","signin","verify","token"]): return "auth"
-        if any(k in s for k in ["email","validate","regex","check"]): return "validate"
-        if any(k in s for k in ["upload","download","request","client","socket"]): return "io"
+        if any(k in s for k in ["auth","login","signin","verify","token","oauth","jwt"]): return "auth"
+        if any(k in s for k in ["email","validate","regex","check","phone","url"]): return "validate"
+        if any(k in s for k in ["upload","download","request","client","socket","stream","io"]): return "io"
         return "default"
 
-    def templates(kind: str, fn: str):
-        if kind == "add":
-            return [
-                (f"{fn} 정상 합산", "a=10, b=20", "30 반환"),
-                (f"{fn} 합산 경계", "a=-1, b=1", "0 반환")
-            ]
-        if kind == "div":
-            return [
-                (f"{fn} 정상 나눗셈", "a=6, b=3", "2 반환"),
-                (f"{fn} 0 나눗셈 예외", "a=1, b=0", "ZeroDivisionError/400")
-            ]
-        return [
-            (f"{fn} 기본 정상", "표준 입력", "성공"),
-            (f"{fn} 비정상 입력", "필수값 누락", "오류 처리")
+    # [ADD] 각 kind별 다양한 시나리오(입력/예상결과를 구체적으로)
+    TEMPLATE_POOL = {
+        "add": [
+            ("{fn} 정상 합산", "a=10, b=20", "30 반환"),
+            ("{fn} 음수/양수 혼합", "a=-5, b=8", "3 반환"),
+            ("{fn} 실수 합산", "a=0.1, b=0.2", "부동소수 오차 허용 범위 내 0.3"),
+            ("{fn} 대용량 정수", "a=10**9, b=10**9", "2*10**9 반환/오버플로우 없음"),
+        ],
+        "div": [
+            ("{fn} 정상 나눗셈", "a=9, b=3", "3 반환"),
+            ("{fn} 0 나눗셈 예외", "a=1, b=0", "ZeroDivisionError/HTTP 400"),
+            ("{fn} 실수 나눗셈", "a=1, b=4", "0.25 반환(반올림 정책 확인)"),
+        ],
+        "read": [
+            ("{fn} 페이지네이션 조회", "page=1, size=20", "20건 반환 및 next 링크 포함"),
+            ("{fn} 필터 조건 조회", "status='ACTIVE'", "상태 일치 레코드만 반환"),
+            ("{fn} 존재하지 않는 키", "id=999999", "404/빈 결과"),
+        ],
+        "write": [
+            ("{fn} 신규 생성", "payload={'name':'A','value':1}", "201/ID 발급 & 영속"),
+            ("{fn} 필수값 누락", "payload={'value':1}", "400/필수 필드 누락 메시지"),
+            ("{fn} 중복 키 처리", "payload={'id':1,'name':'dup'}", "409/중복 충돌"),
+        ],
+        "delete": [
+            ("{fn} 정상 삭제", "id=1 (존재)", "204/재조회 시 미존재"),
+            ("{fn} 미존재 삭제", "id=999999", "404 또는 멱등 처리"),
+        ],
+        "auth": [
+            ("{fn} 유효 토큰", "Authorization='Bearer VALID.JWT'", "200/권한 허용"),
+            ("{fn} 만료 토큰", "Authorization='Bearer EXPIRED.JWT'", "401/토큰 만료"),
+            ("{fn} 권한 부족", "Authorization='Bearer NO_SCOPE'", "403/권한 부족"),
+        ],
+        "validate": [
+            ("{fn} 이메일 정상", "s='user@example.com'", "True 반환"),
+            ("{fn} 이메일 이상", "s='no-at-symbol'", "False/규칙 위반"),
+            ("{fn} URL 검증", "s='https://example.com/path?x=1'", "True/허용"),
+            ("{fn} 전화번호 검증", "s='+82-10-1234-5678'", "지역 규칙에 맞게 True/False"),
+        ],
+        "io": [
+            ("{fn} 업로드 성공", "file=1MB, timeout=5s", "200/무결성 해시 일치"),
+            ("{fn} 다운로드 지연", "timeout=1s (지연 환경)", "타임아웃 후 재시도/백오프"),
+            ("{fn} 스트림 중단", "연결 강제 종료", "부분 수신 처리 및 복구 로직"),
+        ],
+        "default": [
+            ("{fn} 정상 시나리오", "유효 파라미터 1세트", "성공 코드/정상 반환"),
+            ("{fn} 경계/비정상", "필수값 누락/타입 불일치", "명확한 오류 메시지/코드"),
         ]
+    }
 
-    used_ids = set()
-    kinds = set()
-    rows = []
+    used_ids: set[str] = set()
+    used_titles: set[str] = set()
+    rows: list[list[str]] = []
+    kinds_added: set[str] = set()
+
+    # 결정적 인덱스 선택(랜덤 금지, 함수명 해시 기반)
+    def pick_indices(fn: str, pool_len: int, want: int = 2) -> list[int]:
+        if pool_len == 0: return []
+        # sha1 해시로 변이, 충돌 줄임
+        h = int(sha1(fn.encode("utf-8")).hexdigest(), 16)
+        base = h % pool_len
+        step = max(1, (h // 997) % pool_len)
+        idxs = []
+        cur = base
+        for _ in range(want * 3):  # 여유 루프로 중복 피하기
+            if cur not in idxs:
+                idxs.append(cur)
+                if len(idxs) >= want:
+                    break
+            cur = (cur + step) % pool_len
+        return idxs[:want]
+
     seq = 1
     for fn in top_functions:
-        k = classify(fn)
-        if k in kinds:
+        kind = classify(fn)
+        if kind in kinds_added:
             continue
-        t = templates(k, fn)[0]
-        tcid = make_tc_id_from_fn(fn, used_ids, seq)
-        seq += 1
-        rows.append([tcid, t[0], t[1], t[2], "High" if k in {"div","auth","write","delete"} else "Medium"])
+        pool = TEMPLATE_POOL.get(kind, TEMPLATE_POOL["default"])
+        # 함수명을 템플릿에 주입하고, 해시 기반으로 서로 다른 1~2개 선택
+        want_cnt = 2 if kind in {"add","div","write","auth"} else 1
+        indices = pick_indices(fn, len(pool), want=want_cnt)
+        added_local = 0
+        for i in indices:
+            title_t, inp_t, exp_t = pool[i]
+            title = title_t.format(fn=fn)
+            if title in used_titles:
+                continue
+            tcid = make_tc_id_from_fn(fn, used_ids, seq)
+            seq += 1
+            rows.append([tcid, title, inp_t, exp_t, "High" if kind in {"div","auth","write","delete","io","validate"} else "Medium"])
+            used_titles.add(title)
+            added_local += 1
+            if len(rows) >= 3:
+                break
+        if added_local > 0:
+            kinds_added.add(kind)
         if len(rows) >= 3:
             break
-    if not rows:
+
+    # 후보가 부족하면 보강(기본/경계 조합) — 단, 모호 표현 금지
+    if len(rows) == 0:
+        tc1 = make_tc_id_from_fn("Bootstrap_Init", used_ids, 1)
+        tc2 = make_tc_id_from_fn("CorePath_Error", used_ids, 2)
         rows = [
-            [make_tc_id_from_fn("Bootstrap_Init", used_ids, 1), "앱 부팅", "기본 실행", "초기 화면 도달", "Medium"],
-            [make_tc_id_from_fn("CorePath_Error", used_ids, 2), "핵심 경로 오류", "필수값 누락", "명확한 오류", "High"],
+            [tc1, "애플리케이션 부팅 경로 확인", "config=default.yaml, ENV=dev", "초기 화면 렌더/로그인 버튼 노출", "Medium"],
+            [tc2, "핵심 경로 오류 처리", "payload={'id':None}", "400/필수 필드 누락 메시지", "High"],
         ]
-    return pd.DataFrame(rows, columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
+    elif len(rows) == 1:
+        # 하나일 때는 동일 kind 템플릿에서 다른 케이스 추가(중복검사 포함)
+        fn = top_functions[0] if top_functions else "DefaultCase"
+        kind = classify(fn)
+        pool = TEMPLATE_POOL.get(kind, TEMPLATE_POOL["default"])
+        for i, (title_t, inp_t, exp_t) in enumerate(pool):
+            title = title_t.format(fn=fn)
+            if title in used_titles:
+                continue
+            tcid = make_tc_id_from_fn(fn, used_ids, seq); seq += 1
+            rows.append([tcid, title, inp_t, exp_t, "High" if kind in {"div","auth","write","delete","io","validate"} else "Medium"])
+            break
+
+    return pd.DataFrame(rows[:3], columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
 
 # ────────────────────────────────────────────────
 # 🧪 TAB 1: 소스코드 → 테스트케이스 자동 생성기
@@ -544,24 +624,21 @@ with code_tab:
             result = response.json()["choices"][0]["message"]["content"]
             st.session_state.llm_result = result
 
-            # [FIX] ▼ 핵심: 기능별 테이블 분리 + 그룹별 TC ID 재넘버링 + 시트 분리용 저장 ▼
+            # [FIX] ▼ 기능 분리 보강: 1) 표+헤딩 분리 시도 → 2) 실패 시 단일 DF 강제 분리 ▼
             try:
-                tbl_with_heading = _parse_md_tables_with_heading(result)  # 테이블+헤딩 매핑
-                groups = group_tables_and_renumber(result) if tbl_with_heading else {}
-                # 그래도 비었으면(표가 1개거나 헤딩 없는 케이스) — 보조: 단일 테이블을 기능키로 다시 나누기
+                tbl_with_heading = _parse_md_tables_with_heading(result)
+                if tbl_with_heading:
+                    # 표가 여러 개인 경우: 표 단위로 분리(헤딩 유무와 무관)
+                    groups = group_tables_and_renumber(result)
+                else:
+                    # 표 파싱이 아예 안 되었을 때: 파이프 라인/CSV 등은 기존 로직을 건드리지 않음
+                    groups = {}
+
+                # 단일 표/분리 실패 시: TCID prefix/기능설명 키워드로 강제 분할
                 if not groups and tbl_with_heading:
-                    # 표는 있는데 헤딩 키가 모두 공백인 경우, 각 표를 General-1,2..로라도 분리
-                    tmp_groups = {}
-                    unnamed = 0
-                    for (heading, df) in tbl_with_heading:
-                        df_norm = _normalize_headers(df).fillna("")
-                        sheet_name, key_id = _normalize_feature_key(heading, df_norm.iloc[0].to_dict() if len(df_norm) else {})
-                        if not heading:
-                            unnamed += 1
-                            sheet_name = f"{sheet_name}-{unnamed}"
-                        df_norm["TC ID"] = [f"tc-{key_id}-{i:03d}" for i in range(1, len(df_norm)+1)]
-                        tmp_groups[sheet_name[:31]] = df_norm
-                    groups = tmp_groups
+                    # tbl_with_heading에 1개만 있는 경우
+                    single_df = tbl_with_heading[0][1]
+                    groups = split_single_df(single_df)
 
                 st.session_state.parsed_groups = groups if groups else None
                 st.session_state.parsed_df = concat_groups_for_view(groups) if groups else None
@@ -587,7 +664,7 @@ with code_tab:
             st.markdown(f"#### 기능: `{key}`")
             st.dataframe(df, use_container_width=True)
 
-    # [FIX] 엑셀 다운로드: 기능별로 '시트' 분리(시트명=기능명). 그룹 없으면 단일 시트 폴백.
+    # [FIX] 엑셀 다운로드: 기능별 '시트' 분리(시트명=기능명). 그룹 없으면 단일 시트 폴백.
     if (st.session_state.parsed_groups or st.session_state.parsed_df is not None) and not need_llm_call(
             uploaded_file, model, qa_role):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
