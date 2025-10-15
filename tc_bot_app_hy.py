@@ -218,10 +218,12 @@ def _abbr(word: str) -> str:
     }
     return m.get(word.lower(), word.capitalize())
 
-def make_tc_id_from_fn(fn: str, used_ids: set) -> str:
+# [FIX] 넘버링 부여: TC-<Base>-### 형식으로 생성되도록 수정
+def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     """
-    [ADD] 함수명에서 불용어 제거 → 핵심 키워드 2~3개 → PascalCase/약어화 → 'TC-XXX' 형태
-    중복 방지를 위해 숫자 접미어 부여
+    [FIX] 함수명에서 불용어 제거 → 핵심 키워드 2~3개 → PascalCase/약어화 → 'TC-<Base>-###' 형식
+         - seq가 주어지면 해당 넘버를 3자리로 부여
+         - seq가 없으면 1부터 증가시키며 중복 없는 번호를 자동 할당
     """
     stop = {
         "get","set","is","has","have","do","make","build","create","update","insert","delete","remove","fetch","load","read","write",
@@ -235,27 +237,38 @@ def make_tc_id_from_fn(fn: str, used_ids: set) -> str:
     core = core[:3]      # 최대 3개 결합
     base = "".join(_abbr(w) for w in core)
     base = re.sub(r"[^A-Za-z0-9]", "", base)[:24] or re.sub(r"[^A-Za-z0-9]", "", fn.title())[:16] or "Auto"
-    tcid = f"TC-{base}"
-    # 중복 방지
-    suffix = 1
+
+    # 넘버링 로직
+    if seq is not None:
+        n = seq
+    else:
+        n = 1
+        # 사용중인 같은 base의 최대 번호보다 큰 수 찾기
+        pattern = re.compile(rf"^TC-{re.escape(base)}-(\d{{3}})$")
+        for uid in used_ids:
+            m = pattern.match(uid)
+            if m:
+                n = max(n, int(m.group(1)) + 1)
+
+    tcid = f"TC-{base}-{n:03d}"
     while tcid in used_ids:
-        suffix += 1
-        tcid = f"TC-{base}{suffix}"
+        n += 1
+        tcid = f"TC-{base}-{n:03d}"
     used_ids.add(tcid)
     return tcid
 
-# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화 + 도메인형 TC ID)
+# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화 + 도메인형 TC ID 넘버링)
 def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
     """
     [FIX] 요구사항 반영:
-      - 1) 1번/3번 중복 방지: 'kind' 기반 distinct
-      - 2) 3건 고정 X, distinct < 3이면 2건만
-      - 3) 입력값/예상결과 디테일 강화(정상/예외 템플릿)
-      - 4) TC ID를 함수명 기반 도메인형으로 생성 (예: TC-AlarmMgr, TC-UserCtrl 등)
+      - 1) distinct kind 기반 2~3건
+      - 2) 입력/예상결과 디테일 템플릿
+      - 3) TC ID: TC-<키워드>-### 형식으로 넘버링 부여
+      - ※ LLM 생성 TC ID에는 영향 없음 (본 함수는 Auto-Preview 전용)
     """
     rows = []
     used_kinds = set()
-    used_ids = set()  # [ADD] TC ID 중복 방지
+    used_ids = set()  # TC ID 중복 방지
 
     def priority(kind: str) -> str:
         high = {"div", "auth", "write", "delete", "io", "validate"}
@@ -320,20 +333,22 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
         if any(k in s for k in ["upload", "download", "request", "client", "socket"]): return "io"
         return "default"
 
-    # ➊ distinct kind 기준으로 최대 3건 수집
+    # ➊ distinct kind 기준으로 최대 3건 수집 (TC ID에 넘버링 부여)
     candidates = []
+    seq_counter = 1  # [FIX] TC ID 넘버링 시작
     for fn in top_functions:
         kind = classify(fn)
         if kind in used_kinds:
             continue
         used_kinds.add(kind)
         title, inp, exp = templates_for_kind(kind, fn)[0]
-        tcid = make_tc_id_from_fn(fn, used_ids)  # [FIX] 도메인형 TC ID 생성
+        tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] TC-<Base>-### 부여
+        seq_counter += 1
         candidates.append([kind, fn, tcid, title, inp, exp, priority(kind)])
         if len(candidates) >= 3:
             break
 
-    # ➋ 결과 구성 (2~3건 보장, 서로 다른 케이스)
+    # ➋ 결과 구성 (2~3건 보장, 서로 다른 케이스, 넘버링 지속)
     result = []
     if len(candidates) >= 3:
         for c in candidates[:3]:
@@ -346,17 +361,18 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
     elif len(candidates) == 1:
         kind, fn, _, _, _, _, pr = candidates[0]
         t_list = templates_for_kind(kind, fn)
-        # 두 개 템플릿을 서로 다른 ID로
-        for idx, (title, inp, exp) in enumerate(t_list[:2], start=1):
-            tcid = make_tc_id_from_fn(f"{fn}_{idx}", used_ids)  # [FIX] 서로 다른 접미로 유니크 보장
+        # 두 개 템플릿을 서로 다른 ID로 (넘버링 이어서)
+        for (title, inp, exp) in t_list[:2]:
+            tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] 같은 base에 다른 ### 부여
+            seq_counter += 1
             result.append([tcid, title, inp, exp, pr])
     else:
-        # 함수가 전혀 없는 경우: 기본 2건 (서로 다른 ID)
-        id1 = make_tc_id_from_fn("Bootstrap_Init", used_ids)
-        id2 = make_tc_id_from_fn("CorePath_Error", used_ids)
+        # 함수가 전혀 없는 경우: 기본 2건 (서로 다른 ID, 넘버링 부여)
+        tcid1 = make_tc_id_from_fn("Bootstrap_Init", used_ids, seq=1)
+        tcid2 = make_tc_id_from_fn("CorePath_Error", used_ids, seq=2)
         result = [
-            [id1, "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
-            [id2, "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
+            [tcid1, "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
+            [tcid2, "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
         ]
 
     return pd.DataFrame(result, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
@@ -478,6 +494,7 @@ with code_tab:
                                     full_code += f"\n\n# FILE: {file}\n{code}"
                             except:
                                 continue
+            # ⚠️ [중요] LLM 프롬프트/출력 파싱은 변경하지 않음 → LLM 생성 TC ID는 기존과 동일 동작
             prompt = f"""
 너는 시니어 QA 엔지니어이며, 현재 '{qa_role}' 역할을 맡고 있다.
 아래에 제공된 소스코드를 분석하여 기능 단위의 테스트 시나리오 기반 테스트케이스를 생성하라.
