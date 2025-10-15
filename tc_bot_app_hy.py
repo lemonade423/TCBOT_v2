@@ -140,7 +140,7 @@ def build_sample_tc_excel() -> bytes:
         df.to_excel(writer, index=False, sheet_name="테스트케이스")
     return bio.getvalue()
 
-# [ADD] 결과 미리보기(휴리스틱) - Tab1: 코드 ZIP → 통계 + TC 프리뷰 3건
+# [FIX] 결과 미리보기(휴리스틱) - Tab1: 코드 ZIP 분석 확장 (모듈/디렉터리 집계 포함)
 def analyze_code_zip(zip_bytes: bytes) -> dict:
     lang_map = {
         ".py": "Python", ".java": "Java", ".js": "JS", ".ts": "TS",
@@ -149,12 +149,22 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
     lang_counts = Counter()
     top_functions = []
     total_files = 0
+    # [ADD] 모듈(상위 디렉터리) 집계
+    module_counts = Counter()
+    sample_paths = []
 
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
             names = zf.namelist()
             total_files = len(names)
+            sample_paths = names[:10]
             for n in names:
+                # 모듈명 = 최상위 디렉터리, 없으면 '(root)'
+                parts = n.split("/")
+                module = parts[0] if len(parts) > 1 else "(root)"
+                if not n.endswith("/"):  # 디렉터리 엔트리 제외
+                    module_counts[module] += 1
+
                 ext = os.path.splitext(n)[1].lower()
                 if ext in lang_map:
                     lang_counts[lang_map[ext]] += 1
@@ -176,53 +186,96 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
     return {
         "total_files": total_files,
         "lang_counts": lang_counts,
-        "top_functions": top_functions[:50]  # 상한
+        "top_functions": top_functions[:50],   # 상한
+        "module_counts": module_counts,        # [ADD]
+        "sample_paths": sample_paths           # [ADD]
     }
 
 # [ADD] 예상 테스트케이스 개수 추정(간단 휴리스틱)
 def estimate_tc_count(stats: dict) -> int:
-    # 기준: 파일 수·언어 수·탐지된 함수 수를 가중합 (최소 3건 보장)
     files = max(0, stats.get("total_files", 0))
     langs = sum(stats.get("lang_counts", Counter()).values())
     funcs = len(stats.get("top_functions", []))
-    # 가중치: 파일 0.3, 언어 0.7, 함수 0.9 -> 대략적인 볼륨 추정
     estimate = int(files * 0.3 + langs * 0.7 + funcs * 0.9)
-    return max(3, min(estimate, 300))  # 과도한 값 상한
+    return max(3, min(estimate, 300))  # 최소 3건, 최대 300건 제한
 
+# [FIX] 결과 미리보기(휴리스틱) 표를 업로드 코드 기반으로 "동적 생성"
 def build_preview_testcases(stats: dict) -> pd.DataFrame:
-    # 휴리스틱 기반 결과 미리보기(3건)
     rows = []
-    if stats["lang_counts"]:
-        lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
+
+    # 동적 값 계산
+    total_files = stats.get("total_files", 0)
+    lang_counts: Counter = stats.get("lang_counts", Counter())
+    top_functions = stats.get("top_functions", [])
+    module_counts: Counter = stats.get("module_counts", Counter())
+
+    # 1) 언어 기반 로딩 테스트 (동적 설명/결과/우선순위/ID)
+    if lang_counts:
+        lang_str = ", ".join([f"{k} {v}개" for k, v in lang_counts.most_common()])
+        mixed = len(lang_counts) > 1
+        prio1 = "High" if mixed or total_files >= 20 else "Medium"
+        tcid1 = f"TC-PV-LANG-{len(lang_counts)}L-{total_files}F"
+        desc1 = f"언어분포 기반 초기 로딩/파싱 검증 ({lang_str})"
+        expect1 = f"주요 언어별 파서 초기화 및 파일 파싱 성공({total_files}개)"
     else:
-        lang_str = "감지된 언어 없음"
-    rows.append(["TC-PV-001", "언어 혼합 프로젝트 로딩", f"언어분포: {lang_str}", "모든 파일 파싱 성공", "High"])
-    if stats["top_functions"]:
-        fn = stats["top_functions"][0]
-        rows.append(["TC-PV-002", f"핵심 함수/엔드포인트 동작 검증({fn})", "유효/무효 입력 2세트", "정상/에러 응답 구분", "High"])
+        prio1 = "Medium"
+        tcid1 = f"TC-PV-LANG-0L-{total_files}F"
+        desc1 = "단일언어/언어 미검출 프로젝트 로딩"
+        expect1 = f"기본 파서로 전체 파일({total_files}개) 파싱 성공"
+
+    rows.append([tcid1, desc1, "초기 로딩", expect1, prio1])
+
+    # 2) 핵심 함수/엔드포인트 검증 (탐지된 함수명 활용)
+    if top_functions:
+        fn = top_functions[0]
+        prio2 = "High" if len(top_functions) >= 5 else "Medium"
+        tcid2 = f"TC-PV-FUNC-{fn[:12]}"
+        desc2 = f"핵심 함수/엔드포인트 동작 검증({fn})"
+        expect2 = "유효 입력 → 정상 반환 / 무효 입력 → 명확한 예외/에러 코드"
+        input2 = "경계·무효 포함 2세트"
     else:
-        rows.append(["TC-PV-002", "엔드포인트/함수 미검출 시 기본 동작", "기본 실행", "에러 없이 앱 부팅", "Medium"])
-    rows.append(["TC-PV-003", "대상 코드 범위 커버리지 초기 점검", f"파일 수={stats['total_files']}", "주요 모듈별 1개 이상 케이스 존재", "Medium"])
+        prio2 = "Medium"
+        tcid2 = "TC-PV-FUNC-NONE"
+        desc2 = "엔드포인트/함수 미검출 시 기본 동작"
+        expect2 = "기본 실행 경로에서 에러 없이 부팅 및 핵심 화면 진입"
+        input2 = "기본 실행"
+
+    rows.append([tcid2, desc2, input2, expect2, prio2])
+
+    # 3) 모듈(디렉터리) 커버리지 초기 점검 (모듈명/개수 반영)
+    if module_counts:
+        top_mods = [m for m, _ in module_counts.most_common(3)]
+        mod_str = ", ".join(top_mods)
+        prio3 = "High" if len(module_counts) >= 5 else "Medium"
+        tcid3 = f"TC-PV-COV-{len(module_counts)}M"
+        desc3 = f"모듈 커버리지 초기 점검 (주요: {mod_str})"
+        expect3 = f"각 모듈별 최소 1개 케이스 존재(모듈 수={len(module_counts)})"
+    else:
+        prio3 = "Medium"
+        tcid3 = "TC-PV-COV-0M"
+        desc3 = "모듈 구조 미검출 시 기본 커버리지 점검"
+        expect3 = "파일 단위로 최소 1개 케이스 매핑"
+
+    rows.append([tcid3, desc3, f"파일 수={total_files}", expect3, prio3])
+
     return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
 
-# [ADD] 결과 미리보기(휴리스틱) - Tab2: TC → 명세서 요약 프리뷰
+# [ADD] 결과 미리보기(휴리스틱) - Tab2: (요구에 따라 제거) → 함수/호출 남겨두지 않음
 def build_preview_spec(df: pd.DataFrame, summary_type: str) -> str:
-    # 간단 규칙: 기능/요구사항 제목 후보 2~3개 생성
+    # (남겨두지만 사용하지 않음) — 요구사항에 따라 Tab2 미리보기 호출 제거
     titles = []
     if "기능 설명" in df.columns:
         titles = list(pd.Series(df["기능 설명"]).dropna().astype(str).head(3).unique())
     elif "TC ID" in df.columns:
         titles = [f"{summary_type} 기반: {str(df['TC ID'].iloc[i])}" for i in range(min(3, len(df)))]
-
     if not titles:
         titles = [f"{summary_type} 초안 항목"]
-
     lines = []
     for t in titles:
         lines.append(f"- **{t}**\n  - 설명: 입력/예상결과를 기준으로 동작 목적과 예외처리를 요약합니다.\n  - 기대 효과: 기능 명확화, 경계값 확인, 회귀 테스트 기반 확보.")
     return "\n".join(lines)
 
-# [ADD] 결과 미리보기(휴리스틱) - Tab3: 로그 → 시나리오 초안 프리뷰
+# [ADD] 결과 미리보기(휴리스틱) - Tab3: (요구에 따라 제거) → 함수/호출 남겨두지 않음
 def build_preview_scenario(raw_log: str) -> str:
     sev_hits = re.findall(r"(ERROR|Exception|WARN|FATAL)", raw_log, flags=re.IGNORECASE)
     sev_stat = Counter([s.upper() for s in sev_hits])
@@ -261,15 +314,14 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # [ADD] 강화된 결과 미리보기(휴리스틱): 업로드 즉시 "요약 + 3건 프리뷰"
+    # [FIX] 강화된 결과 미리보기: "요약 + 3건 프리뷰" 및 텍스트 라벨 변경
     code_bytes = None
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
         stats = analyze_code_zip(code_bytes)
 
-        # ── 요약 정보 블록: 파일 수 / 언어 / 함수·엔드포인트 / 예상 TC 개수
-        with st.expander("📊 결과 요약(휴리스틱)", expanded=True):
-            # 언어 분포 문자열
+        # ── [FIX] 라벨 변경: "결과 요약(휴리스틱)" → "Auto-Preview(요약)"
+        with st.expander("📊 Auto-Preview(요약)", expanded=True):
             if stats["lang_counts"]:
                 lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
             else:
@@ -284,8 +336,8 @@ with code_tab:
                 f"- **예상 테스트케이스 개수(추정)**: {expected_tc}"
             )
 
-        # ── 휴리스틱 미리보기 3건 표
-        with st.expander("🔮 결과 미리보기(휴리스틱: 테스트케이스 3건)", expanded=True):
+        # ── [FIX] 라벨 변경: "결과 미리보기(휴리스틱: 테스트케이스 3건)" → "Auto-Preview(TC 예상)"
+        with st.expander("🔮 Auto-Preview(TC 예상)", expanded=True):
             pv_df = build_preview_testcases(stats)
             st.dataframe(pv_df, use_container_width=True)
 
@@ -374,7 +426,7 @@ with code_tab:
 with tc_tab:
     st.subheader("📑 테스트케이스 기반 기능/요구사항 명세서 추출기")
 
-    # (요구사항) Tab2에 샘플 테스트케이스 엑셀 다운로드 제공
+    # (요구사항 유지) Tab2에 샘플 테스트케이스 엑셀 다운로드 제공
     st.download_button(
         "⬇️ 샘플 테스트케이스 엑셀 다운로드",
         data=build_sample_tc_excel(),
@@ -391,7 +443,7 @@ with tc_tab:
     if st.button("🚀 명세서 생성하기", disabled=st.session_state["is_loading"]) and tc_file:
         st.session_state["is_loading"] = True
 
-        # (유지) 원래 로직 + (유지) 결과 미리보기(휴리스틱)
+        # [FIX] (요구사항1) Tab2의 휴리스틱 미리보기 제거 — LLM 호출 전 프리뷰 표시 없음
         try:
             if tc_file.name.endswith("csv"):
                 df = pd.read_csv(tc_file)
@@ -401,10 +453,6 @@ with tc_tab:
             st.session_state["is_loading"] = False
             st.error(f"❌ 파일 읽기 실패: {e}")
             st.stop()
-
-        with st.expander("🔮 결과 미리보기(휴리스틱: 요약 초안)", expanded=True):
-            pv_text = build_preview_spec(df, summary_type)
-            st.markdown(pv_text)
 
         with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
             required_cols = ["TC ID", "기능 설명", "입력값", "예상 결과"]
@@ -485,12 +533,10 @@ with log_tab:
     if not API_KEY:
         st.warning("🔐 OpenRouter API Key가 설정되지 않았습니다.")
 
+    # [FIX] (요구사항1) Tab3의 휴리스틱 미리보기 제거 — 업로드 즉시 프리뷰 표시 없음
     raw_log_cache = None
     if log_file:
         raw_log_cache = log_file.read().decode("utf-8", errors="ignore")
-        # (유지) 결과 미리보기(휴리스틱): 재현 시나리오 골격
-        with st.expander("🔮 결과 미리보기(휴리스틱: 시나리오 골격)", expanded=True):
-            st.markdown(build_preview_scenario(raw_log_cache))
 
     if st.button("🚀 시나리오 생성하기", disabled=st.session_state["is_loading"]) and raw_log_cache:
         st.session_state["is_loading"] = True
