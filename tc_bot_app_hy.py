@@ -199,22 +199,68 @@ def estimate_tc_count(stats: dict) -> int:
     estimate = int(files * 0.3 + langs * 0.7 + funcs * 0.9)
     return max(3, min(estimate, 300))  # 최소 3건, 최대 300건 제한
 
-# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화)
+# [ADD] NEW: 함수명 → TC ID 생성 유틸 (실제와 유사한 도메인형 ID)
+def _split_words(name: str) -> list[str]:
+    """[ADD] 카멜/스네이크/기타 구분자 → 토큰 리스트"""
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)  # camelCase 분리
+    s = s.replace("_", " ")
+    return [w for w in re.findall(r"[A-Za-z]+", s) if w]
+
+def _abbr(word: str) -> str:
+    """[ADD] 도메인 용어 약어화"""
+    m = {
+        "manager": "Mgr", "management": "Mgmt",
+        "controller": "Ctrl", "service": "Svc",
+        "repository": "Repo", "configuration": "Config",
+        "request": "Req", "response": "Resp",
+        "application": "App", "message": "Msg",
+        "database": "DB", "client": "Clnt", "server": "Srv"
+    }
+    return m.get(word.lower(), word.capitalize())
+
+def make_tc_id_from_fn(fn: str, used_ids: set) -> str:
+    """
+    [ADD] 함수명에서 불용어 제거 → 핵심 키워드 2~3개 → PascalCase/약어화 → 'TC-XXX' 형태
+    중복 방지를 위해 숫자 접미어 부여
+    """
+    stop = {
+        "get","set","is","has","have","do","make","build","create","update","insert","delete","remove","fetch","load","read","write",
+        "put","post","patch","calc","compute","process","handle","run","exec","call","check","validate","convert","parse","format",
+        "test","temp","main","init","start","stop","open","close","send","receive","retry","download","upload","save","add","sum","plus","div","divide"
+    }
+    words = _split_words(fn)
+    core = [w for w in words if w.lower() not in stop]
+    if not core:
+        core = words[:2]  # 불용어만 있는 경우 앞 2개 사용
+    core = core[:3]      # 최대 3개 결합
+    base = "".join(_abbr(w) for w in core)
+    base = re.sub(r"[^A-Za-z0-9]", "", base)[:24] or re.sub(r"[^A-Za-z0-9]", "", fn.title())[:16] or "Auto"
+    tcid = f"TC-{base}"
+    # 중복 방지
+    suffix = 1
+    while tcid in used_ids:
+        suffix += 1
+        tcid = f"TC-{base}{suffix}"
+    used_ids.add(tcid)
+    return tcid
+
+# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화 + 도메인형 TC ID)
 def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
     """
     [FIX] 요구사항 반영:
-      - 1) 1번/3번 중복 방지: 'kind' 기반으로 중복 제거
-      - 2) 필요시 2건만 출력(3건 고정 X): distinct kind 수 < 3 이면 2건까지만
-      - 3) '입력값', '예상 결과'를 템플릿 기반으로 상세화 (기본입력/일반 문구 지양)
+      - 1) 1번/3번 중복 방지: 'kind' 기반 distinct
+      - 2) 3건 고정 X, distinct < 3이면 2건만
+      - 3) 입력값/예상결과 디테일 강화(정상/예외 템플릿)
+      - 4) TC ID를 함수명 기반 도메인형으로 생성 (예: TC-AlarmMgr, TC-UserCtrl 등)
     """
     rows = []
     used_kinds = set()
+    used_ids = set()  # [ADD] TC ID 중복 방지
 
     def priority(kind: str) -> str:
-        high = {"div", "auth", "write", "delete", "io", "validate"}  # 실패/리스크 높은 영역
+        high = {"div", "auth", "write", "delete", "io", "validate"}
         return "High" if kind in high else "Medium"
 
-    # [ADD] 각 kind 별 정상/에러 2가지 시나리오 템플릿 (디테일 강화)
     def templates_for_kind(kind: str, fn: str):
         fn_disp = fn
         if kind == "add":
@@ -257,13 +303,11 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
                 (f"{fn_disp} 업로드/다운로드 성공", "파일=1MB, timeout=5s", "성공/정상 응답, 무결성 유지"),
                 (f"{fn_disp} 네트워크 타임아웃", "timeout=1s (지연 환경)", "재시도 or 타임아웃 오류 처리")
             ]
-        # default
         return [
             (f"{fn_disp} 기본 정상 동작", "표준 입력 1세트(정상)", "성공 코드/정상 반환"),
             (f"{fn_disp} 비정상 입력 처리", "필수값 누락 또는 타입 불일치", "명확한 오류 메시지/코드 반환")
         ]
 
-    # [ADD] 함수명 → kind 분류
     def classify(fn: str) -> str:
         s = fn.lower()
         if any(k in s for k in ["add", "sum", "plus"]): return "add"
@@ -276,42 +320,43 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
         if any(k in s for k in ["upload", "download", "request", "client", "socket"]): return "io"
         return "default"
 
-    # ➊ 우선 distinct kind 기준으로 3건까지 후보 수집
+    # ➊ distinct kind 기준으로 최대 3건 수집
     candidates = []
     for fn in top_functions:
         kind = classify(fn)
         if kind in used_kinds:
             continue
         used_kinds.add(kind)
-        # kind별 템플릿 2개 중 "핵심" 1개를 우선 후보로
         title, inp, exp = templates_for_kind(kind, fn)[0]
-        candidates.append([kind, fn, title, inp, exp, priority(kind)])
+        tcid = make_tc_id_from_fn(fn, used_ids)  # [FIX] 도메인형 TC ID 생성
+        candidates.append([kind, fn, tcid, title, inp, exp, priority(kind)])
         if len(candidates) >= 3:
             break
 
-    # ➋ distinct가 2개 미만이면, 동일 kind의 2번째 템플릿을 사용해 '서로 다른' 2건 구성
+    # ➋ 결과 구성 (2~3건 보장, 서로 다른 케이스)
     result = []
     if len(candidates) >= 3:
-        # 상위 3건 그대로 사용 (이미 kind 중복 제거)
-        for i, c in enumerate(candidates[:3], start=1):
-            kind, fn, title, inp, exp, pr = c
-            result.append([f"TC-FN-{i:03d}", title, inp, exp, pr])
+        for c in candidates[:3]:
+            kind, fn, tcid, title, inp, exp, pr = c
+            result.append([tcid, title, inp, exp, pr])
     elif len(candidates) == 2:
-        for i, c in enumerate(candidates, start=1):
-            kind, fn, title, inp, exp, pr = c
-            result.append([f"TC-FN-{i:03d}", title, inp, exp, pr])
+        for c in candidates:
+            kind, fn, tcid, title, inp, exp, pr = c
+            result.append([tcid, title, inp, exp, pr])
     elif len(candidates) == 1:
-        # 하나뿐이면 같은 kind의 2가지 템플릿(정상/예외)으로 2건 구성 (서로 다름 보장)
-        kind, fn, _, _, _, pr = candidates[0]
+        kind, fn, _, _, _, _, pr = candidates[0]
         t_list = templates_for_kind(kind, fn)
-        # 두 개 템플릿 사용
-        for i, (title, inp, exp) in enumerate(t_list[:2], start=1):
-            result.append([f"TC-FN-{i:03d}", title, inp, exp, pr])
+        # 두 개 템플릿을 서로 다른 ID로
+        for idx, (title, inp, exp) in enumerate(t_list[:2], start=1):
+            tcid = make_tc_id_from_fn(f"{fn}_{idx}", used_ids)  # [FIX] 서로 다른 접미로 유니크 보장
+            result.append([tcid, title, inp, exp, pr])
     else:
-        # 함수가 전혀 없는 경우: 기본 2건(서로 다른 입력/결과) 제시
+        # 함수가 전혀 없는 경우: 기본 2건 (서로 다른 ID)
+        id1 = make_tc_id_from_fn("Bootstrap_Init", used_ids)
+        id2 = make_tc_id_from_fn("CorePath_Error", used_ids)
         result = [
-            ["TC-FN-001", "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
-            ["TC-FN-002", "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
+            [id1, "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
+            [id2, "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
         ]
 
     return pd.DataFrame(result, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
@@ -404,9 +449,9 @@ with code_tab:
                 f"- **예상 테스트케이스 개수(추정)**: {expected_tc}"
             )
 
-        # [FIX] 라벨 유지: Auto-Preview(Sample TC) / 생성 로직 개선된 함수 사용
+        # (유지) 라벨: Auto-Preview(Sample TC) / 생성 로직: 함수명 분석 기반
         with st.expander("🔮 Auto-Preview(Sample TC)", expanded=True):
-            sample_df = build_function_based_sample_tc(stats.get("top_functions", []))  # [FIX]
+            sample_df = build_function_based_sample_tc(stats.get("top_functions", []))
             st.dataframe(sample_df, use_container_width=True)
 
     if uploaded_file and need_llm_call(uploaded_file, model, qa_role):
