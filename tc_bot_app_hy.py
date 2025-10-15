@@ -199,17 +199,15 @@ def estimate_tc_count(stats: dict) -> int:
     estimate = int(files * 0.3 + langs * 0.7 + funcs * 0.9)
     return max(3, min(estimate, 300))  # 최소 3건, 최대 300건 제한
 
-
-# =========================
-# [ADD] ▼ TC ID 정규화/병합 파이프라인 (강화) ▼
-# =========================
-
+# [ADD] NEW: 함수명 → TC ID 생성 유틸 (실제와 유사한 도메인형 ID)
 def _split_words(name: str) -> list[str]:
+    """[ADD] 카멜/스네이크/기타 구분자 → 토큰 리스트"""
     s = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)  # camelCase 분리
     s = s.replace("_", " ")
     return [w for w in re.findall(r"[A-Za-z]+", s) if w]
 
 def _abbr(word: str) -> str:
+    """[ADD] 도메인 용어 약어화"""
     m = {
         "manager": "Mgr", "management": "Mgmt",
         "controller": "Ctrl", "service": "Svc",
@@ -220,264 +218,13 @@ def _abbr(word: str) -> str:
     }
     return m.get(word.lower(), word.capitalize())
 
-# [ADD] 마크다운 코드펜스 제거(테이블 파싱 방해 요소 제거)
-def _strip_code_fences(md: str) -> str:
-    return re.sub(r"```.*?```", "", md, flags=re.DOTALL)
-
-# [FIX] 마크다운 표 탐지 강화: 변형된 구분선/공백/섹션 별 표까지 수집
-def _parse_all_markdown_tables(md_text: str) -> list[pd.DataFrame]:
-    text = _strip_code_fences(md_text)
-    lines = text.splitlines()
-    tables = []
-    i = 0
-    while i < len(lines) - 1:
-        header = lines[i].strip()
-        sep = lines[i + 1].strip() if i + 1 < len(lines) else ""
-        if "|" in header and re.search(r"\|\s*:?-{2,}\s*\|", sep):  # [FIX] 구분선 완화
-            j = i + 2
-            rows = [header, sep]
-            while j < len(lines):
-                cur = lines[j]
-                if cur.strip() == "" or ("|" not in cur):
-                    break
-                rows.append(cur)
-                j += 1
-            df = _markdown_table_to_df("\n".join(rows))
-            if df is not None and len(df.columns) >= 3:
-                tables.append(df)
-            i = j
-        else:
-            i += 1
-    return tables
-
-def _markdown_table_to_df(table_str: str) -> pd.DataFrame | None:
-    raw = [r for r in table_str.splitlines() if r.strip()]
-    if len(raw) < 2:
-        return None
-    headers = [h.strip() for h in raw[0].strip("|").split("|")]
-    # 정렬라인 제외
-    data_lines = [r for r in raw[2:]]
-    rows = []
-    for line in data_lines:
-        if "|" not in line:
-            continue
-        parts = [c.strip() for c in line.strip("|").split("|")]
-        if len(parts) != len(headers):
-            continue
-        rows.append(parts)
-    if not rows:
-        return None
-    df = pd.DataFrame(rows, columns=headers)
-    return df
-
-# [ADD] 루즈 테이블 스캐너: 파이프 기반 라인 묶음들을 표로 복원 (헤더 추정 포함)
-def _extract_loose_tables(md_text: str) -> list[pd.DataFrame]:
-    text = _strip_code_fences(md_text)
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    groups = []
-    cur = []
-    for ln in lines:
-        if "|" in ln and ln.count("|") >= 2:
-            cur.append(ln)
-        else:
-            if len(cur) >= 2:
-                groups.append(cur)
-            cur = []
-    if len(cur) >= 2:
-        groups.append(cur)
-
-    dfs = []
-    for g in groups:
-        # 헤더 추정: 파이프 수가 가장 많은 라인을 헤더로 간주
-        header_line = max(g, key=lambda s: s.count("|"))
-        headers = [h.strip() for h in header_line.strip("|").split("|")]
-        data_rows = []
-        for ln in g:
-            if ln is header_line:
-                continue
-            parts = [c.strip() for c in ln.strip("|").split("|")]
-            if len(parts) != len(headers):
-                continue
-            data_rows.append(parts)
-        if data_rows:
-            dfs.append(pd.DataFrame(data_rows, columns=headers))
-    return dfs
-
-# [ADD] CSV 스타일 라인 파서(헤더/쉼표 기반)
-def _extract_csv_like(md_text: str) -> list[pd.DataFrame]:
-    text = _strip_code_fences(md_text)
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    # CSV 헤더 후보 탐지: TC, 기능 등의 키워드를 포함
-    header_idx = None
-    for idx, ln in enumerate(lines):
-        if re.search(r"(TC\s*ID|기능\s*설명|입력값|예상\s*결과|우선순위)", ln, re.IGNORECASE):
-            header_idx = idx
-            break
-    if header_idx is None:
-        return []
-    headers = [h.strip() for h in re.split(r"[,\|]", lines[header_idx])]
-    rows = []
-    for ln in lines[header_idx + 1:]:
-        parts = [c.strip() for c in re.split(r"[,\|]", ln)]
-        if len(parts) >= len(headers):
-            rows.append(parts[:len(headers)])
-    if not rows:
-        return []
-    try:
-        return [pd.DataFrame(rows, columns=headers)]
-    except Exception:
-        return []
-
-# [ADD] 헤더 표준화 + 단일 테이블 병합
-def _normalize_tc_table_union(dfs: list[pd.DataFrame]) -> pd.DataFrame:
-    if not dfs:
-        return pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
-    header_map = {
-        "TC ID":"TC ID","TCID":"TC ID","ID":"TC ID","케이스ID":"TC ID",
-        "기능 설명":"기능 설명","기능설명":"기능 설명","Feature":"기능 설명","기능":"기능 설명","Description":"기능 설명",
-        "입력값":"입력값","Input":"입력값","입력":"입력값","Parameters":"입력값",
-        "예상 결과":"예상 결과","Expected":"예상 결과","기대 결과":"예상 결과","Output":"예상 결과","결과":"예상 결과",
-        "우선순위":"우선순위","Priority":"우선순위","우선 순위":"우선순위","Risk":"우선순위"
-    }
-    norm = []
-    for df in dfs:
-        new_cols = {}
-        for c in df.columns:
-            key = header_map.get(str(c).strip(), None)
-            if key:
-                new_cols[c] = key
-        df2 = df.rename(columns=new_cols)
-        keep = [c for c in ["TC ID","기능 설명","입력값","예상 결과","우선순위"] if c in df2.columns]
-        if len(keep) < 3:
-            continue
-        df2 = df2[keep]
-        norm.append(df2)
-    if not norm:
-        return pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
-    merged = pd.concat(norm, ignore_index=True)
-    for c in ["TC ID","기능 설명","입력값","예상 결과","우선순위"]:
-        if c not in merged.columns:
-            merged[c] = ""
-    return merged[["TC ID","기능 설명","입력값","예상 결과","우선순위"]]
-
-# [ADD] 도메인 키 생성 (TCID/기능설명에서 추출 → 약어화)
-def _build_domain_key_from(tc_id: str, feature: str) -> str:
-    m = re.match(r"TC[-_]?([A-Za-z0-9]+)", str(tc_id or "").strip())
-    words = []
-    if m and m.group(1) and not m.group(1).isdigit():
-        words = _split_words(m.group(1))
-    if not words:
-        words = _split_words(str(feature or ""))
-    stop = {"tc","id","case","test","spec","req","feature","table","class","function"}
-    core = [w for w in words if w.lower() not in stop]
-    if not core:
-        core = words[:2]
-    core = core[:3]
-    key = "".join(_abbr(w) for w in core) or "Auto"
-    key = re.sub(r"[^A-Za-z0-9]", "", key)[:24] or "Auto"
-    return key
-
-# [FIX] 강제 TC ID 재할당: TC-<KEY>-NNN (무조건 적용)
-def _normalize_tc_ids_domain_seq(df: pd.DataFrame) -> pd.DataFrame:
-    counters: dict[str,int] = {}
-    out_ids = []
-    for _, row in df.iterrows():
-        key = _build_domain_key_from(row.get("TC ID",""), row.get("기능 설명",""))
-        n = counters.get(key, 0) + 1
-        counters[key] = n
-        out_ids.append(f"TC-{key}-{n:03d}")
-    df = df.copy()
-    df["TC ID"] = out_ids
-    return df
-
-# [FIX] LLM 결과 → 단일 테이블 + TC-KEY-NNN 강제화 엔드투엔드
-def normalize_llm_result_to_single_table(md_text: str) -> pd.DataFrame:
-    # 1) 마크다운 표 수집(강화 파서)
-    dfs = _parse_all_markdown_tables(md_text)
-    # 2) 없으면 루즈 테이블 스캔
-    if not dfs:
-        dfs = _extract_loose_tables(md_text)
-    # 3) 그래도 없으면 CSV 유사 파서
-    if not dfs:
-        dfs = _extract_csv_like(md_text)
-    # 4) 병합 + 헤더 표준화
-    merged = _normalize_tc_table_union(dfs)
-    # 5) 비어 있으면 최종 폴백: 파이프 라인 기반 간이 파서
-    if merged.empty:
-        rows = []
-        headers = None
-        for line in _strip_code_fences(md_text).splitlines():
-            if "|" in line and "TC" in line:
-                parts = [p.strip() for p in line.strip().strip("|").split("|")]
-                # 헤더 감지
-                if headers is None and re.search(r"TC\s*ID", line, re.IGNORECASE):
-                    headers = parts
-                    continue
-                if headers and len(parts) == len(headers):
-                    rows.append(parts)
-        if headers and rows:
-            try:
-                df_tmp = pd.DataFrame(rows, columns=headers)
-                merged = _normalize_tc_table_union([df_tmp])
-            except Exception:
-                pass
-    # 6) 여전히 비면 빈 테이블 반환
-    if merged.empty:
-        return pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
-    # 7) 최종: TC ID 강제 규격화
-    merged = merged.fillna("")
-    merged = _normalize_tc_ids_domain_seq(merged)
-    return merged
-# =========================
-# [ADD] ▲ 파이프라인 끝 ▲
-# =========================
-
-
-# ────────────────────────────────────────────────
-# [ADD] 결과 미리보기(휴리스틱) - Tab2/Tab3용 보조 함수(요구상 미사용)
-# ────────────────────────────────────────────────
-def build_preview_testcases(stats: dict) -> pd.DataFrame:
-    rows = []
-    total_files = stats.get("total_files", 0)
-    lang_counts: Counter = stats.get("lang_counts", Counter())
-    top_functions = stats.get("top_functions", [])
-    module_counts: Counter = stats.get("module_counts", Counter())
-    if lang_counts:
-        lang_str = ", ".join([f"{k} {v}개" for k, v in lang_counts.most_common()])
-        rows.append(["TC-PV-LANG", f"언어분포 기반 초기 로딩/파싱 검증 ({lang_str})", "초기 로딩", f"파일 파싱 성공({total_files}개)", "Medium"])
-    if top_functions:
-        fn = top_functions[0]
-        rows.append(["TC-PV-FUNC", f"핵심 함수/엔드포인트 동작 검증({fn})", "경계·무효 포함 2세트", "정상/에러 구분", "High"])
-    rows.append(["TC-PV-COV", "모듈 커버리지 초기 점검", f"파일 수={total_files}", f"모듈 수={len(module_counts)}", "Medium"])
-    return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
-
-def build_preview_spec(df: pd.DataFrame, summary_type: str) -> str:
-    titles = []
-    if "기능 설명" in df.columns:
-        titles = list(pd.Series(df["기능 설명"]).dropna().astype(str).head(3).unique())
-    elif "TC ID" in df.columns:
-        titles = [f"{summary_type} 기반: {str(df['TC ID'].iloc[i])}" for i in range(min(3, len(df)))]
-    if not titles:
-        titles = [f"{summary_type} 초안 항목"]
-    lines = []
-    for t in titles:
-        lines.append(f"- **{t}**\n  - 설명: 입력/예상결과를 기준으로 동작 목적과 예외처리를 요약합니다.\n  - 기대 효과: 기능 명확화, 경계값 확인, 회귀 테스트 기반 확보.")
-    return "\n".join(lines)
-
-def build_preview_scenario(raw_log: str) -> str:
-    sev_hits = re.findall(r"(ERROR|Exception|WARN|FATAL)", raw_log, flags=re.IGNORECASE)
-    sev_stat = Counter([s.upper() for s in sev_hits])
-    top = sev_stat.most_common(1)[0][0] if sev_stat else "INFO"
-    return (
-        "1. 시나리오 제목: 초기 재현 시도 (로그 패턴 기반)\n"
-        f"2. 전제 조건: 로그 심각도 분포 {dict(sev_stat)}\n"
-        "3. 테스트 입력값: 최소 재현 입력(최근 에러 직전 단계)\n"
-        "4. 재현 절차: 에러 유발 직전 흐름 추적 → 동일 환경/버전에서 단계 수행\n"
-        f"5. 기대 결과: {top} 레벨 이벤트 재현 및 추가 진단 정보 확보"
-    )
-
-# [ADD] Auto-Preview(Sample TC) 전용 TCID 생성 유틸 (기존 유지)
+# [FIX] 넘버링 부여: TC-<Base>-### 형식으로 생성되도록 수정
 def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
+    """
+    [FIX] 함수명에서 불용어 제거 → 핵심 키워드 2~3개 → PascalCase/약어화 → 'TC-<Base>-###' 형식
+         - seq가 주어지면 해당 넘버를 3자리로 부여
+         - seq가 없으면 1부터 증가시키며 중복 없는 번호를 자동 할당
+    """
     stop = {
         "get","set","is","has","have","do","make","build","create","update","insert","delete","remove","fetch","load","read","write",
         "put","post","patch","calc","compute","process","handle","run","exec","call","check","validate","convert","parse","format",
@@ -486,15 +233,17 @@ def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     words = _split_words(fn)
     core = [w for w in words if w.lower() not in stop]
     if not core:
-        core = words[:2]
-    core = core[:3]
+        core = words[:2]  # 불용어만 있는 경우 앞 2개 사용
+    core = core[:3]      # 최대 3개 결합
     base = "".join(_abbr(w) for w in core)
     base = re.sub(r"[^A-Za-z0-9]", "", base)[:24] or re.sub(r"[^A-Za-z0-9]", "", fn.title())[:16] or "Auto"
 
+    # 넘버링 로직
     if seq is not None:
         n = seq
     else:
         n = 1
+        # 사용중인 같은 base의 최대 번호보다 큰 수 찾기
         pattern = re.compile(rf"^TC-{re.escape(base)}-(\d{{3}})$")
         for uid in used_ids:
             m = pattern.match(uid)
@@ -508,11 +257,18 @@ def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     used_ids.add(tcid)
     return tcid
 
-# [FIX] Auto-Preview(Sample TC) 생성기 (기존 유지)
+# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화 + 도메인형 TC ID 넘버링)
 def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
+    """
+    [FIX] 요구사항 반영:
+      - 1) distinct kind 기반 2~3건
+      - 2) 입력/예상결과 디테일 템플릿
+      - 3) TC ID: TC-<키워드>-### 형식으로 넘버링 부여
+      - ※ LLM 생성 TC ID에는 영향 없음 (본 함수는 Auto-Preview 전용)
+    """
     rows = []
     used_kinds = set()
-    used_ids = set()
+    used_ids = set()  # TC ID 중복 방지
 
     def priority(kind: str) -> str:
         high = {"div", "auth", "write", "delete", "io", "validate"}
@@ -577,36 +333,43 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
         if any(k in s for k in ["upload", "download", "request", "client", "socket"]): return "io"
         return "default"
 
+    # ➊ distinct kind 기준으로 최대 3건 수집 (TC ID에 넘버링 부여)
     candidates = []
-    seq_counter = 1
+    seq_counter = 1  # [FIX] TC ID 넘버링 시작
     for fn in top_functions:
         kind = classify(fn)
-        if kind in set(k for k, *_ in candidates):
+        if kind in used_kinds:
             continue
+        used_kinds.add(kind)
         title, inp, exp = templates_for_kind(kind, fn)[0]
-        tcid = make_tc_id_from_fn(fn, set(), seq=seq_counter)
+        tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] TC-<Base>-### 부여
         seq_counter += 1
-        candidates.append((kind, fn, tcid, title, inp, exp, "High" if kind in {"div","auth","write","delete","io","validate"} else "Medium"))
+        candidates.append([kind, fn, tcid, title, inp, exp, priority(kind)])
         if len(candidates) >= 3:
             break
 
+    # ➋ 결과 구성 (2~3건 보장, 서로 다른 케이스, 넘버링 지속)
     result = []
     if len(candidates) >= 3:
-        for _, _, tcid, title, inp, exp, pr in candidates[:3]:
+        for c in candidates[:3]:
+            kind, fn, tcid, title, inp, exp, pr = c
             result.append([tcid, title, inp, exp, pr])
     elif len(candidates) == 2:
-        for _, _, tcid, title, inp, exp, pr in candidates:
+        for c in candidates:
+            kind, fn, tcid, title, inp, exp, pr = c
             result.append([tcid, title, inp, exp, pr])
     elif len(candidates) == 1:
         kind, fn, _, _, _, _, pr = candidates[0]
         t_list = templates_for_kind(kind, fn)
+        # 두 개 템플릿을 서로 다른 ID로 (넘버링 이어서)
         for (title, inp, exp) in t_list[:2]:
-            tcid = make_tc_id_from_fn(fn, set(), seq=seq_counter)
+            tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] 같은 base에 다른 ### 부여
             seq_counter += 1
             result.append([tcid, title, inp, exp, pr])
     else:
-        tcid1 = make_tc_id_from_fn("Bootstrap_Init", set(), seq=1)
-        tcid2 = make_tc_id_from_fn("CorePath_Error", set(), seq=2)
+        # 함수가 전혀 없는 경우: 기본 2건 (서로 다른 ID, 넘버링 부여)
+        tcid1 = make_tc_id_from_fn("Bootstrap_Init", used_ids, seq=1)
+        tcid2 = make_tc_id_from_fn("CorePath_Error", used_ids, seq=2)
         result = [
             [tcid1, "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
             [tcid2, "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
@@ -614,7 +377,47 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
 
     return pd.DataFrame(result, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
 
+# [ADD] (기존 함수: 언어/모듈까지 반영하던 휴리스틱) — 유지하되, 현재는 사용하지 않음
+def build_preview_testcases(stats: dict) -> pd.DataFrame:
+    rows = []
+    total_files = stats.get("total_files", 0)
+    lang_counts: Counter = stats.get("lang_counts", Counter())
+    top_functions = stats.get("top_functions", [])
+    module_counts: Counter = stats.get("module_counts", Counter())
+    if lang_counts:
+        lang_str = ", ".join([f"{k} {v}개" for k, v in lang_counts.most_common()])
+        rows.append(["TC-PV-LANG", f"언어분포 기반 초기 로딩/파싱 검증 ({lang_str})", "초기 로딩", f"파일 파싱 성공({total_files}개)", "Medium"])
+    if top_functions:
+        fn = top_functions[0]
+        rows.append(["TC-PV-FUNC", f"핵심 함수/엔드포인트 동작 검증({fn})", "경계·무효 포함 2세트", "정상/에러 구분", "High"])
+    rows.append(["TC-PV-COV", "모듈 커버리지 초기 점검", f"파일 수={total_files}", f"모듈 수={len(module_counts)}", "Medium"])
+    return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
 
+# [ADD] 결과 미리보기(휴리스틱) - Tab2/Tab3용 보조 함수(요구상 미사용)
+def build_preview_spec(df: pd.DataFrame, summary_type: str) -> str:
+    titles = []
+    if "기능 설명" in df.columns:
+        titles = list(pd.Series(df["기능 설명"]).dropna().astype(str).head(3).unique())
+    elif "TC ID" in df.columns:
+        titles = [f"{summary_type} 기반: {str(df['TC ID'].iloc[i])}" for i in range(min(3, len(df)))]
+    if not titles:
+        titles = [f"{summary_type} 초안 항목"]
+    lines = []
+    for t in titles:
+        lines.append(f"- **{t}**\n  - 설명: 입력/예상결과를 기준으로 동작 목적과 예외처리를 요약합니다.\n  - 기대 효과: 기능 명확화, 경계값 확인, 회귀 테스트 기반 확보.")
+    return "\n".join(lines)
+
+def build_preview_scenario(raw_log: str) -> str:
+    sev_hits = re.findall(r"(ERROR|Exception|WARN|FATAL)", raw_log, flags=re.IGNORECASE)
+    sev_stat = Counter([s.upper() for s in sev_hits])
+    top = sev_stat.most_common(1)[0][0] if sev_stat else "INFO"
+    return (
+        "1. 시나리오 제목: 초기 재현 시도 (로그 패턴 기반)\n"
+        f"2. 전제 조건: 로그 심각도 분포 {dict(sev_stat)}\n"
+        "3. 테스트 입력값: 최소 재현 입력(최근 에러 직전 단계)\n"
+        "4. 재현 절차: 에러 유발 직전 흐름 추적 → 동일 환경/버전에서 단계 수행\n"
+        f"5. 기대 결과: {top} 레벨 이벤트 재현 및 추가 진단 정보 확보"
+    )
 
 # ────────────────────────────────────────────────
 # 🧪 TAB 1: 소스코드 → 테스트케이스 자동 생성기
@@ -642,7 +445,7 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # (유지) 요약 블록 + Sample TC
+    # (유지) 요약 블록
     code_bytes = None
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
@@ -662,6 +465,7 @@ with code_tab:
                 f"- **예상 테스트케이스 개수(추정)**: {expected_tc}"
             )
 
+        # (유지) 라벨: Auto-Preview(Sample TC) / 생성 로직: 함수명 분석 기반
         with st.expander("🔮 Auto-Preview(Sample TC)", expanded=True):
             sample_df = build_function_based_sample_tc(stats.get("top_functions", []))
             st.dataframe(sample_df, use_container_width=True)
@@ -690,6 +494,7 @@ with code_tab:
                                     full_code += f"\n\n# FILE: {file}\n{code}"
                             except:
                                 continue
+            # ⚠️ [중요] LLM 프롬프트/출력 파싱은 변경하지 않음 → LLM 생성 TC ID는 기존과 동일 동작
             prompt = f"""
 너는 시니어 QA 엔지니어이며, 현재 '{qa_role}' 역할을 맡고 있다.
 아래에 제공된 소스코드를 분석하여 기능 단위의 테스트 시나리오 기반 테스트케이스를 생성하라.
@@ -715,16 +520,16 @@ with code_tab:
                 })
             result = response.json()["choices"][0]["message"]["content"]
             st.session_state.llm_result = result
-
-            # [FIX] ▼▼▼ 어떤 형태로 와도: 모두 병합 + ID 규격화 강제 ▼▼▼
-            try:
-                merged = normalize_llm_result_to_single_table(result)
-                st.session_state.parsed_df = merged
-            except Exception:
-                # 최후 폴백: 빈 표라도 리턴
-                st.session_state.parsed_df = pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
-            # [FIX] ▲▲▲ 끝 ▲▲▲
-
+            rows = []
+            for line in result.splitlines():
+                if "|" in line and "TC" in line:
+                    parts = [p.strip() for p in line.strip().split("|")[1:-1]]
+                    if len(parts) == 5:
+                        rows.append(parts)
+            if rows:
+                df = pd.DataFrame(
+                    rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
+                st.session_state.parsed_df = df
             st.session_state.last_uploaded_file = uploaded_file.name
             st.session_state.last_model = model
             st.session_state.last_role = qa_role
