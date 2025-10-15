@@ -199,70 +199,87 @@ def estimate_tc_count(stats: dict) -> int:
     estimate = int(files * 0.3 + langs * 0.7 + funcs * 0.9)
     return max(3, min(estimate, 300))  # 최소 3건, 최대 300건 제한
 
-# [FIX] 결과 미리보기(휴리스틱) 표를 업로드 코드 기반으로 "동적 생성"
+# [ADD] NEW: "함수명 분석 기반" 샘플 TC 생성기 (최대 3건)
+def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
+    """
+    [ADD] 함수/엔드포인트명 키워드 분석으로 샘플 TC 2~3건 생성
+    - LLM 미사용, 휴리스틱 규칙 기반
+    - 우선순위/입력값/예상결과를 키워드에 맞춰 동적으로 구성
+    """
+    rows = []
+    def pick_priority(kind: str) -> str:
+        # 위험도 높은 케이스 우선
+        high_kinds = {"div_zero", "auth", "write", "upload", "delete", "email_invalid"}
+        return "High" if kind in high_kinds else "Medium"
+
+    def tc_from_fn(fn: str, idx: int):
+        fn_l = fn.lower()
+        # 산술: add/sum/plus
+        if any(k in fn_l for k in ["add", "sum", "plus"]):
+            return [f"TC-FN-{idx:03d}", f"{fn} 함수 정상 합산 검증",
+                    "a=1, b=2", "3 반환", pick_priority("arith")]
+        # 나눗셈: div → 0 나눗셈
+        if "div" in fn_l or "divide" in fn_l:
+            return [f"TC-FN-{idx:03d}", f"{fn} 함수 0 나눗셈 예외 처리 검증",
+                    "a=1, b=0", "ZeroDivisionError 또는 에러 코드 반환", pick_priority("div_zero")]
+        # 조회: get/fetch/load
+        if any(k in fn_l for k in ["get", "fetch", "load", "read"]):
+            return [f"TC-FN-{idx:03d}", f"{fn} 함수 데이터 조회 검증",
+                    "유효 ID=1", "정상 데이터 반환(HTTP 200/정상 응답)", pick_priority("read")]
+        # 생성/갱신/저장
+        if any(k in fn_l for k in ["save", "create", "update", "insert", "post", "put"]):
+            return [f"TC-FN-{idx:03d}", f"{fn} 함수 쓰기 동작 검증",
+                    "유효 payload 1건", "성공 상태 및 영속 반영", pick_priority("write")]
+        # 삭제
+        if any(k in fn_l for k in ["delete", "remove"]):
+            return [f"TC-FN-{idx:03d}", f"{fn} 함수 삭제 동작 검증",
+                    "존재 ID=1", "삭제 성공 및 재조회시 미존재", pick_priority("delete")]
+        # 인증/권한
+        if any(k in fn_l for k in ["auth", "login", "signin", "verify", "token"]):
+            return [f"TC-FN-{idx:03d}", f"{fn} 인증/권한 검증",
+                    "잘못된 자격증명", "접근 거부(401/403)", pick_priority("auth")]
+        # 이메일/검증
+        if any(k in fn_l for k in ["email", "validate", "regex", "check"]):
+            return [f"TC-FN-{idx:03d}", f"{fn} 입력 검증(이메일) 검증",
+                    "s='invalid@domain'", "유효성 실패 처리", pick_priority("email_invalid")]
+        # 네트워크/IO
+        if any(k in fn_l for k in ["upload", "download", "request", "client", "socket"]):
+            return [f"TC-FN-{idx:03d}", f"{fn} 네트워크/IO 동작 검증",
+                    "타임아웃 1s", "타임아웃/재시도/오류 처리 기대", pick_priority("upload")]
+        # 기본
+        return [f"TC-FN-{idx:03d}", f"{fn} 기본 동작 검증",
+                "기본 입력", "예상 결과 반환 또는 오류 처리", pick_priority("default")]
+
+    # 상위 3개만 사용
+    for i, fn in enumerate(top_functions[:3], start=1):
+        rows.append(tc_from_fn(fn, i))
+
+    # 함수가 하나도 없을 때 기본 2건 제시
+    if not rows:
+        rows = [
+            ["TC-FN-001", "엔트리포인트 기본 부팅 검증", "기본 실행", "에러 없이 초기 화면/상태 도달", "Medium"],
+            ["TC-FN-002", "핵심 경로 예외 처리 기본 검증", "유효하지 않은 입력", "명확한 오류 메시지/코드 반환", "High"],
+        ]
+    return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
+
+# [ADD] (기존 함수: 언어/모듈까지 반영하던 휴리스틱) — 유지하되, 더 이상 사용하지 않음
 def build_preview_testcases(stats: dict) -> pd.DataFrame:
     rows = []
-
-    # 동적 값 계산
     total_files = stats.get("total_files", 0)
     lang_counts: Counter = stats.get("lang_counts", Counter())
     top_functions = stats.get("top_functions", [])
     module_counts: Counter = stats.get("module_counts", Counter())
-
-    # 1) 언어 기반 로딩 테스트 (동적 설명/결과/우선순위/ID)
     if lang_counts:
         lang_str = ", ".join([f"{k} {v}개" for k, v in lang_counts.most_common()])
-        mixed = len(lang_counts) > 1
-        prio1 = "High" if mixed or total_files >= 20 else "Medium"
-        tcid1 = f"TC-PV-LANG-{len(lang_counts)}L-{total_files}F"
-        desc1 = f"언어분포 기반 초기 로딩/파싱 검증 ({lang_str})"
-        expect1 = f"주요 언어별 파서 초기화 및 파일 파싱 성공({total_files}개)"
-    else:
-        prio1 = "Medium"
-        tcid1 = f"TC-PV-LANG-0L-{total_files}F"
-        desc1 = "단일언어/언어 미검출 프로젝트 로딩"
-        expect1 = f"기본 파서로 전체 파일({total_files}개) 파싱 성공"
-
-    rows.append([tcid1, desc1, "초기 로딩", expect1, prio1])
-
-    # 2) 핵심 함수/엔드포인트 검증 (탐지된 함수명 활용)
+        rows.append(["TC-PV-LANG", f"언어분포 기반 초기 로딩/파싱 검증 ({lang_str})", "초기 로딩", f"파일 파싱 성공({total_files}개)", "Medium"])
     if top_functions:
         fn = top_functions[0]
-        prio2 = "High" if len(top_functions) >= 5 else "Medium"
-        tcid2 = f"TC-PV-FUNC-{fn[:12]}"
-        desc2 = f"핵심 함수/엔드포인트 동작 검증({fn})"
-        expect2 = "유효 입력 → 정상 반환 / 무효 입력 → 명확한 예외/에러 코드"
-        input2 = "경계·무효 포함 2세트"
-    else:
-        prio2 = "Medium"
-        tcid2 = "TC-PV-FUNC-NONE"
-        desc2 = "엔드포인트/함수 미검출 시 기본 동작"
-        expect2 = "기본 실행 경로에서 에러 없이 부팅 및 핵심 화면 진입"
-        input2 = "기본 실행"
-
-    rows.append([tcid2, desc2, input2, expect2, prio2])
-
-    # 3) 모듈(디렉터리) 커버리지 초기 점검 (모듈명/개수 반영)
-    if module_counts:
-        top_mods = [m for m, _ in module_counts.most_common(3)]
-        mod_str = ", ".join(top_mods)
-        prio3 = "High" if len(module_counts) >= 5 else "Medium"
-        tcid3 = f"TC-PV-COV-{len(module_counts)}M"
-        desc3 = f"모듈 커버리지 초기 점검 (주요: {mod_str})"
-        expect3 = f"각 모듈별 최소 1개 케이스 존재(모듈 수={len(module_counts)})"
-    else:
-        prio3 = "Medium"
-        tcid3 = "TC-PV-COV-0M"
-        desc3 = "모듈 구조 미검출 시 기본 커버리지 점검"
-        expect3 = "파일 단위로 최소 1개 케이스 매핑"
-
-    rows.append([tcid3, desc3, f"파일 수={total_files}", expect3, prio3])
-
+        rows.append(["TC-PV-FUNC", f"핵심 함수/엔드포인트 동작 검증({fn})", "경계·무효 포함 2세트", "정상/에러 구분", "High"])
+    rows.append(["TC-PV-COV", "모듈 커버리지 초기 점검", f"파일 수={total_files}", f"모듈 수={len(module_counts)}", "Medium"])
     return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
 
-# [ADD] 결과 미리보기(휴리스틱) - Tab2: (요구에 따라 제거) → 함수/호출 남겨두지 않음
+# [ADD] 결과 미리보기(휴리스틱) - Tab2/Tab3용 보조 함수(요구상 미사용)
 def build_preview_spec(df: pd.DataFrame, summary_type: str) -> str:
-    # (남겨두지만 사용하지 않음) — 요구사항에 따라 Tab2 미리보기 호출 제거
     titles = []
     if "기능 설명" in df.columns:
         titles = list(pd.Series(df["기능 설명"]).dropna().astype(str).head(3).unique())
@@ -275,7 +292,6 @@ def build_preview_spec(df: pd.DataFrame, summary_type: str) -> str:
         lines.append(f"- **{t}**\n  - 설명: 입력/예상결과를 기준으로 동작 목적과 예외처리를 요약합니다.\n  - 기대 효과: 기능 명확화, 경계값 확인, 회귀 테스트 기반 확보.")
     return "\n".join(lines)
 
-# [ADD] 결과 미리보기(휴리스틱) - Tab3: (요구에 따라 제거) → 함수/호출 남겨두지 않음
 def build_preview_scenario(raw_log: str) -> str:
     sev_hits = re.findall(r"(ERROR|Exception|WARN|FATAL)", raw_log, flags=re.IGNORECASE)
     sev_stat = Counter([s.upper() for s in sev_hits])
@@ -314,13 +330,13 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # [FIX] 강화된 결과 미리보기: "요약 + 3건 프리뷰" 및 텍스트 라벨 변경
+    # [FIX] 강화된 결과 미리보기: "함수명 분석 기반" + 라벨 텍스트 변경
     code_bytes = None
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
         stats = analyze_code_zip(code_bytes)
 
-        # ── [FIX] 라벨 변경: "결과 요약(휴리스틱)" → "Auto-Preview(요약)"
+        # (유지) 요약 블록
         with st.expander("📊 Auto-Preview(요약)", expanded=True):
             if stats["lang_counts"]:
                 lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
@@ -328,7 +344,6 @@ with code_tab:
                 lang_str = "감지된 언어 없음"
             funcs_cnt = len(stats["top_functions"])
             expected_tc = estimate_tc_count(stats)
-
             st.markdown(
                 f"- **파일 수**: {stats['total_files']}\n"
                 f"- **언어 분포**: {lang_str}\n"
@@ -336,10 +351,11 @@ with code_tab:
                 f"- **예상 테스트케이스 개수(추정)**: {expected_tc}"
             )
 
-        # ── [FIX] 라벨 변경: "결과 미리보기(휴리스틱: 테스트케이스 3건)" → "Auto-Preview(TC 예상)"
-        with st.expander("🔮 Auto-Preview(TC 예상)", expanded=True):
-            pv_df = build_preview_testcases(stats)
-            st.dataframe(pv_df, use_container_width=True)
+        # [FIX] 라벨 변경: "Auto-Preview(TC 예상)" → "Auto-Preview(Sample TC)"
+        # [FIX] 생성 로직 변경: build_preview_testcases(stats) → build_function_based_sample_tc(stats['top_functions'])
+        with st.expander("🔮 Auto-Preview(Sample TC)", expanded=True):
+            sample_df = build_function_based_sample_tc(stats.get("top_functions", []))  # [FIX]
+            st.dataframe(sample_df, use_container_width=True)
 
     if uploaded_file and need_llm_call(uploaded_file, model, qa_role):
         st.session_state["is_loading"] = True
@@ -443,7 +459,7 @@ with tc_tab:
     if st.button("🚀 명세서 생성하기", disabled=st.session_state["is_loading"]) and tc_file:
         st.session_state["is_loading"] = True
 
-        # [FIX] (요구사항1) Tab2의 휴리스틱 미리보기 제거 — LLM 호출 전 프리뷰 표시 없음
+        # (요구사항) Tab2는 휴리스틱 미리보기 제외 — 기존 로직 유지
         try:
             if tc_file.name.endswith("csv"):
                 df = pd.read_csv(tc_file)
@@ -533,7 +549,7 @@ with log_tab:
     if not API_KEY:
         st.warning("🔐 OpenRouter API Key가 설정되지 않았습니다.")
 
-    # [FIX] (요구사항1) Tab3의 휴리스틱 미리보기 제거 — 업로드 즉시 프리뷰 표시 없음
+    # (요구사항) Tab3는 휴리스틱 미리보기 제외 — 기존 로직 유지
     raw_log_cache = None
     if log_file:
         raw_log_cache = log_file.read().decode("utf-8", errors="ignore")
