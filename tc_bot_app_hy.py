@@ -199,70 +199,124 @@ def estimate_tc_count(stats: dict) -> int:
     estimate = int(files * 0.3 + langs * 0.7 + funcs * 0.9)
     return max(3, min(estimate, 300))  # 최소 3건, 최대 300건 제한
 
-# [ADD] NEW: "함수명 분석 기반" 샘플 TC 생성기 (최대 3건)
+# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화)
 def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
     """
-    [ADD] 함수/엔드포인트명 키워드 분석으로 샘플 TC 2~3건 생성
-    - LLM 미사용, 휴리스틱 규칙 기반
-    - 우선순위/입력값/예상결과를 키워드에 맞춰 동적으로 구성
+    [FIX] 요구사항 반영:
+      - 1) 1번/3번 중복 방지: 'kind' 기반으로 중복 제거
+      - 2) 필요시 2건만 출력(3건 고정 X): distinct kind 수 < 3 이면 2건까지만
+      - 3) '입력값', '예상 결과'를 템플릿 기반으로 상세화 (기본입력/일반 문구 지양)
     """
     rows = []
-    def pick_priority(kind: str) -> str:
-        # 위험도 높은 케이스 우선
-        high_kinds = {"div_zero", "auth", "write", "upload", "delete", "email_invalid"}
-        return "High" if kind in high_kinds else "Medium"
+    used_kinds = set()
 
-    def tc_from_fn(fn: str, idx: int):
-        fn_l = fn.lower()
-        # 산술: add/sum/plus
-        if any(k in fn_l for k in ["add", "sum", "plus"]):
-            return [f"TC-FN-{idx:03d}", f"{fn} 함수 정상 합산 검증",
-                    "a=1, b=2", "3 반환", pick_priority("arith")]
-        # 나눗셈: div → 0 나눗셈
-        if "div" in fn_l or "divide" in fn_l:
-            return [f"TC-FN-{idx:03d}", f"{fn} 함수 0 나눗셈 예외 처리 검증",
-                    "a=1, b=0", "ZeroDivisionError 또는 에러 코드 반환", pick_priority("div_zero")]
-        # 조회: get/fetch/load
-        if any(k in fn_l for k in ["get", "fetch", "load", "read"]):
-            return [f"TC-FN-{idx:03d}", f"{fn} 함수 데이터 조회 검증",
-                    "유효 ID=1", "정상 데이터 반환(HTTP 200/정상 응답)", pick_priority("read")]
-        # 생성/갱신/저장
-        if any(k in fn_l for k in ["save", "create", "update", "insert", "post", "put"]):
-            return [f"TC-FN-{idx:03d}", f"{fn} 함수 쓰기 동작 검증",
-                    "유효 payload 1건", "성공 상태 및 영속 반영", pick_priority("write")]
-        # 삭제
-        if any(k in fn_l for k in ["delete", "remove"]):
-            return [f"TC-FN-{idx:03d}", f"{fn} 함수 삭제 동작 검증",
-                    "존재 ID=1", "삭제 성공 및 재조회시 미존재", pick_priority("delete")]
-        # 인증/권한
-        if any(k in fn_l for k in ["auth", "login", "signin", "verify", "token"]):
-            return [f"TC-FN-{idx:03d}", f"{fn} 인증/권한 검증",
-                    "잘못된 자격증명", "접근 거부(401/403)", pick_priority("auth")]
-        # 이메일/검증
-        if any(k in fn_l for k in ["email", "validate", "regex", "check"]):
-            return [f"TC-FN-{idx:03d}", f"{fn} 입력 검증(이메일) 검증",
-                    "s='invalid@domain'", "유효성 실패 처리", pick_priority("email_invalid")]
-        # 네트워크/IO
-        if any(k in fn_l for k in ["upload", "download", "request", "client", "socket"]):
-            return [f"TC-FN-{idx:03d}", f"{fn} 네트워크/IO 동작 검증",
-                    "타임아웃 1s", "타임아웃/재시도/오류 처리 기대", pick_priority("upload")]
-        # 기본
-        return [f"TC-FN-{idx:03d}", f"{fn} 기본 동작 검증",
-                "기본 입력", "예상 결과 반환 또는 오류 처리", pick_priority("default")]
+    def priority(kind: str) -> str:
+        high = {"div", "auth", "write", "delete", "io", "validate"}  # 실패/리스크 높은 영역
+        return "High" if kind in high else "Medium"
 
-    # 상위 3개만 사용
-    for i, fn in enumerate(top_functions[:3], start=1):
-        rows.append(tc_from_fn(fn, i))
-
-    # 함수가 하나도 없을 때 기본 2건 제시
-    if not rows:
-        rows = [
-            ["TC-FN-001", "엔트리포인트 기본 부팅 검증", "기본 실행", "에러 없이 초기 화면/상태 도달", "Medium"],
-            ["TC-FN-002", "핵심 경로 예외 처리 기본 검증", "유효하지 않은 입력", "명확한 오류 메시지/코드 반환", "High"],
+    # [ADD] 각 kind 별 정상/에러 2가지 시나리오 템플릿 (디테일 강화)
+    def templates_for_kind(kind: str, fn: str):
+        fn_disp = fn
+        if kind == "add":
+            return [
+                (f"{fn_disp} 정상 합산", "a=10, b=20 (정상값)", "30 반환"),
+                (f"{fn_disp} 합산 경계값", "a=-1, b=1 (음수+양수)", "오버플로우/언더플로우 없이 0 반환")
+            ]
+        if kind == "div":
+            return [
+                (f"{fn_disp} 정상 나눗셈", "a=6, b=3 (정상값)", "2 반환(정수/실수 처리 일관)"),
+                (f"{fn_disp} 0 나눗셈 예외", "a=1, b=0 (비정상)", "ZeroDivisionError 또는 400/예외 코드")
+            ]
+        if kind == "read":
+            return [
+                (f"{fn_disp} 유효 조회", "id=1 (존재)", "정상 데이터 반환(HTTP 200/OK)"),
+                (f"{fn_disp} 미존재 조회", "id=999999 (미존재)", "404/빈 결과 반환")
+            ]
+        if kind == "write":
+            return [
+                (f"{fn_disp} 유효 쓰기", "payload={'name':'A','value':1}", "201/성공 및 영속 반영"),
+                (f"{fn_disp} 필수값 누락", "payload={'value':1} (name 누락)", "400/검증 오류 메시지")
+            ]
+        if kind == "delete":
+            return [
+                (f"{fn_disp} 유효 삭제", "id=1 (존재)", "삭제 성공 및 재조회 시 미존재"),
+                (f"{fn_disp} 중복/미존재 삭제", "id=999999 (미존재)", "404 또는 멱등 처리")
+            ]
+        if kind == "auth":
+            return [
+                (f"{fn_disp} 유효 토큰 접근", "Bearer 유효토큰", "200/권한 허용"),
+                (f"{fn_disp} 만료/위조 토큰", "Bearer 만료/위조 토큰", "401/403 접근 거부")
+            ]
+        if kind == "validate":
+            return [
+                (f"{fn_disp} 이메일 유효성(정상)", "s='user@example.com'", "True/허용"),
+                (f"{fn_disp} 이메일 유효성(이상)", "s='invalid@domain'", "False/422 또는 검증 실패")
+            ]
+        if kind == "io":
+            return [
+                (f"{fn_disp} 업로드/다운로드 성공", "파일=1MB, timeout=5s", "성공/정상 응답, 무결성 유지"),
+                (f"{fn_disp} 네트워크 타임아웃", "timeout=1s (지연 환경)", "재시도 or 타임아웃 오류 처리")
+            ]
+        # default
+        return [
+            (f"{fn_disp} 기본 정상 동작", "표준 입력 1세트(정상)", "성공 코드/정상 반환"),
+            (f"{fn_disp} 비정상 입력 처리", "필수값 누락 또는 타입 불일치", "명확한 오류 메시지/코드 반환")
         ]
-    return pd.DataFrame(rows, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
 
-# [ADD] (기존 함수: 언어/모듈까지 반영하던 휴리스틱) — 유지하되, 더 이상 사용하지 않음
+    # [ADD] 함수명 → kind 분류
+    def classify(fn: str) -> str:
+        s = fn.lower()
+        if any(k in s for k in ["add", "sum", "plus"]): return "add"
+        if any(k in s for k in ["div", "divide"]): return "div"
+        if any(k in s for k in ["get", "fetch", "load", "read"]): return "read"
+        if any(k in s for k in ["save", "create", "update", "insert", "post", "put"]): return "write"
+        if any(k in s for k in ["delete", "remove"]): return "delete"
+        if any(k in s for k in ["auth", "login", "signin", "verify", "token"]): return "auth"
+        if any(k in s for k in ["email", "validate", "regex", "check"]): return "validate"
+        if any(k in s for k in ["upload", "download", "request", "client", "socket"]): return "io"
+        return "default"
+
+    # ➊ 우선 distinct kind 기준으로 3건까지 후보 수집
+    candidates = []
+    for fn in top_functions:
+        kind = classify(fn)
+        if kind in used_kinds:
+            continue
+        used_kinds.add(kind)
+        # kind별 템플릿 2개 중 "핵심" 1개를 우선 후보로
+        title, inp, exp = templates_for_kind(kind, fn)[0]
+        candidates.append([kind, fn, title, inp, exp, priority(kind)])
+        if len(candidates) >= 3:
+            break
+
+    # ➋ distinct가 2개 미만이면, 동일 kind의 2번째 템플릿을 사용해 '서로 다른' 2건 구성
+    result = []
+    if len(candidates) >= 3:
+        # 상위 3건 그대로 사용 (이미 kind 중복 제거)
+        for i, c in enumerate(candidates[:3], start=1):
+            kind, fn, title, inp, exp, pr = c
+            result.append([f"TC-FN-{i:03d}", title, inp, exp, pr])
+    elif len(candidates) == 2:
+        for i, c in enumerate(candidates, start=1):
+            kind, fn, title, inp, exp, pr = c
+            result.append([f"TC-FN-{i:03d}", title, inp, exp, pr])
+    elif len(candidates) == 1:
+        # 하나뿐이면 같은 kind의 2가지 템플릿(정상/예외)으로 2건 구성 (서로 다름 보장)
+        kind, fn, _, _, _, pr = candidates[0]
+        t_list = templates_for_kind(kind, fn)
+        # 두 개 템플릿 사용
+        for i, (title, inp, exp) in enumerate(t_list[:2], start=1):
+            result.append([f"TC-FN-{i:03d}", title, inp, exp, pr])
+    else:
+        # 함수가 전혀 없는 경우: 기본 2건(서로 다른 입력/결과) 제시
+        result = [
+            ["TC-FN-001", "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
+            ["TC-FN-002", "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
+        ]
+
+    return pd.DataFrame(result, columns=["TC ID", "기능 설명", "입력값", "예상 결과", "우선순위"])
+
+# [ADD] (기존 함수: 언어/모듈까지 반영하던 휴리스틱) — 유지하되, 현재는 사용하지 않음
 def build_preview_testcases(stats: dict) -> pd.DataFrame:
     rows = []
     total_files = stats.get("total_files", 0)
@@ -330,13 +384,12 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # [FIX] 강화된 결과 미리보기: "함수명 분석 기반" + 라벨 텍스트 변경
+    # (유지) 요약 블록
     code_bytes = None
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
         stats = analyze_code_zip(code_bytes)
 
-        # (유지) 요약 블록
         with st.expander("📊 Auto-Preview(요약)", expanded=True):
             if stats["lang_counts"]:
                 lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()])
@@ -351,8 +404,7 @@ with code_tab:
                 f"- **예상 테스트케이스 개수(추정)**: {expected_tc}"
             )
 
-        # [FIX] 라벨 변경: "Auto-Preview(TC 예상)" → "Auto-Preview(Sample TC)"
-        # [FIX] 생성 로직 변경: build_preview_testcases(stats) → build_function_based_sample_tc(stats['top_functions'])
+        # [FIX] 라벨 유지: Auto-Preview(Sample TC) / 생성 로직 개선된 함수 사용
         with st.expander("🔮 Auto-Preview(Sample TC)", expanded=True):
             sample_df = build_function_based_sample_tc(stats.get("top_functions", []))  # [FIX]
             st.dataframe(sample_df, use_container_width=True)
