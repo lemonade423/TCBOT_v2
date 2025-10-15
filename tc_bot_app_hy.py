@@ -26,7 +26,7 @@ for key in ["scenario_result", "spec_result", "llm_result", "parsed_df", "last_u
     if key not in st.session_state:
         st.session_state[key] = None
 
-# [ADD] 기능별 그룹 보관용 세션 키 추가 (기존 흐름 영향 없음)
+# [ADD] 기능별 그룹 보관용 세션 키 (엑셀 시트 분리용)
 if "parsed_groups" not in st.session_state:
     st.session_state["parsed_groups"] = None
 
@@ -52,7 +52,7 @@ else:
     st.empty()
 
 # ────────────────────────────────────────────────
-# 🔧 유틸 함수: 에러 로그 전처리
+# 🔧 유틸 함수: 에러 로그 전처리 (기존 유지)
 # ────────────────────────────────────────────────
 MODEL_TOKEN_LIMITS = {
     "qwen/qwen-max": 30720,
@@ -199,15 +199,19 @@ def estimate_tc_count(stats: dict) -> int:
     return max(3, min(estimate, 300))
 
 # ────────────────────────────────────────────────
-# [ADD] LLM 결과 포맷: 기능별 테이블 분리 + 그룹별 넘버링 재부여 파이프라인
+# [ADD] LLM 결과 포맷(핵심): **기능별 테이블 분리 + 그룹별 TC ID 재넘버링 + 엑셀 시트 분리**
 # ────────────────────────────────────────────────
 
 # [ADD] 코드펜스 제거(테이블 파싱 방해 방지)
 def _strip_code_fences(md: str) -> str:
     return re.sub(r"```.*?```", "", md, flags=re.DOTALL)
 
-# [ADD] 마크다운 표 파싱(일반형)
-def _parse_md_tables(md_text: str) -> list[pd.DataFrame]:
+# [ADD] 마크다운 테이블 + 직전 헤딩 매핑 추출
+def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]]:
+    """
+    [핵심] 문서에서 마크다운 테이블을 모두 찾고, 각 테이블에 대해
+    바로 위(최대 5줄 이내)의 섹션 헤딩(##, ### 등) 또는 굵은 텍스트를 기능명으로 매핑.
+    """
     text = _strip_code_fences(md_text)
     lines = text.splitlines()
     tables = []
@@ -216,6 +220,30 @@ def _parse_md_tables(md_text: str) -> list[pd.DataFrame]:
         header = lines[i].strip()
         sep = lines[i + 1].strip() if i + 1 < len(lines) else ""
         if "|" in header and re.search(r"\|\s*:?-{2,}\s*\|", sep):
+            # ↑ 표 시작 감지
+            # ➊ 기능명 후보: 직전 1~5줄에서 헤딩/굵은 텍스트/라벨 추출
+            feature_name = ""
+            for back in range(1, 6):
+                if i - back < 0:
+                    break
+                prev = lines[i - back].strip()
+                # 헤딩 패턴
+                m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", prev)
+                if m:
+                    feature_name = m.group(1)
+                    break
+                # 굵은 텍스트 라벨(예: **Alarm Manager**)
+                m2 = re.match(r"^\s{0,3}\*\*(.+?)\*\*\s*$", prev)
+                if m2:
+                    feature_name = m2.group(1)
+                    break
+                # '기능: XXX' 라벨
+                m3 = re.match(r"^\s*(기능|Feature)\s*[:：]\s*(.+?)\s*$", prev, flags=re.IGNORECASE)
+                if m3:
+                    feature_name = m3.group(2)
+                    break
+
+            # ➋ 테이블 바디 수집
             j = i + 2
             rows = [header, sep]
             while j < len(lines):
@@ -224,9 +252,10 @@ def _parse_md_tables(md_text: str) -> list[pd.DataFrame]:
                     break
                 rows.append(cur)
                 j += 1
+
             df = _md_table_to_df("\n".join(rows))
             if df is not None and len(df.columns) >= 3:
-                tables.append(df)
+                tables.append((feature_name, df))
             i = j
         else:
             i += 1
@@ -272,52 +301,74 @@ def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
             df2[c] = ""
     return df2[["TC ID","기능 설명","입력값","예상 결과","우선순위"]]
 
-# [ADD] 기능 키 추출: TC ID 또는 기능 설명에서 도메인 키 산출
-def _extract_feature_key(tc_id: str, feature: str) -> str:
-    # TC-<key>-NNN, TC-<key>, TC<NNN> 등에서 키 추출
-    m = re.match(r"(?i)TC[-_]?([A-Za-z0-9]+)", str(tc_id or "").strip())
-    key = ""
-    if m and m.group(1) and not m.group(1).isdigit():
-        key = m.group(1)
+# [ADD] 기능 키 정규화(시트명/ID용)
+def _normalize_feature_key(name: str, sample_row: dict | None = None) -> str:
+    key = (name or "").strip()
     if not key:
-        # 기능 설명에서 첫 의미 토큰 추정 (알파넘 최대 2~3개 결합)
-        tokens = re.findall(r"[A-Za-z][A-Za-z0-9]+", str(feature or ""))
-        if tokens:
-            key = "".join(tokens[:2])
+        # TC ID/기능설명에서 보조 추출
+        if sample_row:
+            tcid = str(sample_row.get("TC ID",""))
+            feat = str(sample_row.get("기능 설명",""))
+            m = re.match(r"(?i)TC[-_]?([A-Za-z0-9]+)", tcid)
+            if m and m.group(1) and not m.group(1).isdigit():
+                key = m.group(1)
+            if not key:
+                tks = re.findall(r"[A-Za-z][A-Za-z0-9]+", feat)
+                if tks:
+                    key = "".join(tks[:2])
     key = key or "General"
-    key = re.sub(r"[^A-Za-z0-9]", "", key)
-    return key.lower()
+    key = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key).strip()
+    # ID 접두용은 소문자/영숫자만, 공백→하이픈
+    key_id = re.sub(r"[^A-Za-z0-9 ]", "", key).strip().lower().replace(" ", "-") or "general"
+    return key, key_id
 
-# [ADD] 기능별 그룹핑 + 그룹 내 넘버링 재부여 (tc-<key>-NNN)
-def split_and_renumber_by_feature(dfs: list[pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    if not dfs:
+# [ADD] 핵심: 기능별 그룹핑(테이블 경계 보존) + 그룹 내 tc-<key>-NNN 재부여
+def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
+    """
+    요구사항 구현:
+    - LLM이 기능별로 표를 나눠주면: 각 표를 기능으로 간주(직전 헤딩/라벨 기준).
+    - 표가 하나만 와도: 기능명을 비워둘 수 있으므로 보조 규칙으로 키 산출.
+    - 각 기능 그룹마다 TC ID는 'tc-<key>-NNN'(001부터)로 **재부여**.
+    - 반환: {sheet_name: DataFrame}
+    """
+    tbls = _parse_md_tables_with_heading(md_text)
+    if not tbls:
         return {}
-    # 표준화 후 하나로 합침
-    normed = [_normalize_headers(df) for df in dfs]
-    merged = pd.concat(normed, ignore_index=True).fillna("")
-    # 기능키 산출
-    merged["_feature_key_"] = merged.apply(
-        lambda r: _extract_feature_key(r.get("TC ID",""), r.get("기능 설명","")),
-        axis=1
-    )
-    groups = {}
-    for key, sub in merged.groupby("_feature_key_"):
-        sub = sub.drop(columns=["_feature_key_"]).reset_index(drop=True)
-        # 그룹별 넘버링 001부터
-        ids = [f"tc-{key}-{i:03d}" for i in range(1, len(sub)+1)]
-        sub = sub.copy()
-        sub["TC ID"] = ids
-        groups[key] = sub
+
+    groups: dict[str, pd.DataFrame] = {}
+    unnamed_count = 0
+
+    for (heading, df) in tbls:
+        df_norm = _normalize_headers(df).fillna("")
+        # 기능명/키 생성
+        sample_row = df_norm.iloc[0].to_dict() if len(df_norm) else {}
+        sheet_name, key_id = _normalize_feature_key(heading, sample_row)
+        if not heading:
+            unnamed_count += 1
+            # 같은 'General'이 반복될 수 있어 시트명 유니크 처리
+            sheet_name = f"{sheet_name}-{unnamed_count}"
+        # 그룹 내 넘버링: 001부터
+        df_g = df_norm.copy()
+        df_g["TC ID"] = [f"tc-{key_id}-{i:03d}" for i in range(1, len(df_g)+1)]
+        # 같은 시트명이 이미 있다면 뒤에 -2, -3 … 부여
+        final_name = sheet_name[:31] if len(sheet_name) > 31 else sheet_name
+        cnt = 2
+        while final_name in groups:
+            candidate = (sheet_name[:27] + f"-{cnt}") if len(sheet_name) > 27 else f"{sheet_name}-{cnt}"
+            final_name = candidate[:31]
+            cnt += 1
+        groups[final_name] = df_g
+
     return groups
 
-# [ADD] 화면 표시용: 그룹 결합 테이블 생성(보기 전용)
+# [ADD] 화면 표시용(결합 표): 보기 편하도록 기능컬럼 추가해 합쳐서 보여줌
 def concat_groups_for_view(groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not groups:
-        return pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위","기능"])
+        return pd.DataFrame(columns=["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"])
     view_rows = []
-    for key, df in groups.items():
+    for sheet, df in groups.items():
         df2 = df.copy()
-        df2["기능"] = key
+        df2["기능"] = sheet
         view_rows.append(df2)
     return pd.concat(view_rows, ignore_index=True)[["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"]]
 
@@ -493,12 +544,26 @@ with code_tab:
             result = response.json()["choices"][0]["message"]["content"]
             st.session_state.llm_result = result
 
-            # [FIX] ▼ LLM 결과 → 기능별 테이블 분리 + 그룹별 넘버링 재부여 ▼
+            # [FIX] ▼ 핵심: 기능별 테이블 분리 + 그룹별 TC ID 재넘버링 + 시트 분리용 저장 ▼
             try:
-                md_tables = _parse_md_tables(result)                  # 1) 모든 표 파싱
-                groups = split_and_renumber_by_feature(md_tables)      # 2) 기능 키 기준 그룹핑 + tc-<key>-NNN 재부여
-                st.session_state.parsed_groups = groups                # 3) 세션 보관(엑셀 시트 생성 용)
-                # (기존 parsed_df는 화면 호환을 위해 결합표 형태로 유지)
+                tbl_with_heading = _parse_md_tables_with_heading(result)  # 테이블+헤딩 매핑
+                groups = group_tables_and_renumber(result) if tbl_with_heading else {}
+                # 그래도 비었으면(표가 1개거나 헤딩 없는 케이스) — 보조: 단일 테이블을 기능키로 다시 나누기
+                if not groups and tbl_with_heading:
+                    # 표는 있는데 헤딩 키가 모두 공백인 경우, 각 표를 General-1,2..로라도 분리
+                    tmp_groups = {}
+                    unnamed = 0
+                    for (heading, df) in tbl_with_heading:
+                        df_norm = _normalize_headers(df).fillna("")
+                        sheet_name, key_id = _normalize_feature_key(heading, df_norm.iloc[0].to_dict() if len(df_norm) else {})
+                        if not heading:
+                            unnamed += 1
+                            sheet_name = f"{sheet_name}-{unnamed}"
+                        df_norm["TC ID"] = [f"tc-{key_id}-{i:03d}" for i in range(1, len(df_norm)+1)]
+                        tmp_groups[sheet_name[:31]] = df_norm
+                    groups = tmp_groups
+
+                st.session_state.parsed_groups = groups if groups else None
                 st.session_state.parsed_df = concat_groups_for_view(groups) if groups else None
             except Exception:
                 st.session_state.parsed_groups = None
@@ -510,20 +575,19 @@ with code_tab:
             st.session_state.last_role = qa_role
         st.session_state["is_loading"] = False
 
-    # 결과 표시(원문 + 그룹 결합 표 미리보기)
+    # 결과 표시(원문 + 기능별 표 미리보기)
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
         st.markdown("## 📋 생성된 테스트케이스 (LLM 원문)")
         st.markdown(st.session_state.llm_result)
 
-    # [ADD] 기능별 테이블 결과 미리보기
     if st.session_state.parsed_groups:
-        st.markdown("## 📦 기능별 테스트케이스 (그룹/재넘버링 반영)")
+        st.markdown("## 📦 기능별 테스트케이스 (테이블 분리 + 기능별 ID 재넘버링 반영)")
         for key, df in st.session_state.parsed_groups.items():
             st.markdown(f"#### 기능: `{key}`")
             st.dataframe(df, use_container_width=True)
 
-    # [FIX] 엑셀 다운로드: 기능별로 시트 분리(시트명=기능명). 그룹이 없으면 기존 단일 시트로 폴백.
+    # [FIX] 엑셀 다운로드: 기능별로 '시트' 분리(시트명=기능명). 그룹 없으면 단일 시트 폴백.
     if (st.session_state.parsed_groups or st.session_state.parsed_df is not None) and not need_llm_call(
             uploaded_file, model, qa_role):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
