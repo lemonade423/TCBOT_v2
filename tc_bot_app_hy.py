@@ -828,7 +828,8 @@ with code_tab:
 - **TC ID는 반드시 tc-<feature-key>-NNN 형식**을 사용하라. (예: tc-alarm-001)
 - <feature-key>는 아래 힌트 목록의 key 중 가장 적합한 값을 사용한다.
 - 각 기능 섹션마다 NNN은 001부터 다시 시작한다.
-- 기능 섹션 외의 불필요한 텍스트는 넣지 말라.
+# [REQ] 자연스러운 설명 허용: 이전 버전처럼 필요 시 설명/요약을 함께 작성할 수 있도록, 불필요 텍스트 금지 규칙을 제거함
+# - 기능 섹션 외의 불필요한 텍스트는 넣지 말라.
 
 [기능 힌트 목록]
 {hints_md}
@@ -880,10 +881,14 @@ with code_tab:
             '</small>',
             unsafe_allow_html=True
         )
-        # 정규화된 원문(테이블들) 출력
-        st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
+        # [REQ] LLM 원문 출력: 정규화본 대신 LLM 결과 원문을 그대로 표시하여,
+        # 과거 소스처럼 상황에 따라 설명이 자연스럽게 포함될 수 있도록 함
+        st.markdown(st.session_state.llm_result)
 
-        # [FIX] 설명: 기능설명/우선순위 분포/요약만 출력, 헤더는 "Feature (총 N건)"
+        # [REQ] 설명 하드코딩 출력 제거: 고정 "설명" 섹션을 주석 처리하여
+        # 테이블 아래에 고정 문구가 항상 붙는 동작을 비활성화
+        """
+        # --- 아래 블록 전체 주석 처리 (고정 설명 제거) ---
         st.markdown("---")
         st.markdown("### 설명")
         try:
@@ -896,6 +901,8 @@ with code_tab:
         except Exception as _e:
             st.caption("설명 생성 중 경고: 동적 요약에 실패하여 기본 안내만 표시합니다.")
             st.markdown("_기능별 테이블을 기준으로 우선순위 분포와 요약을 제공합니다._")
+        # --- 주석 처리 끝 ---
+        """
 
     # [FIX] (요청4) 무슨 일이 있어도 '엑셀 다운로드' 버튼은 항상 표시
     excel_bytes = None
