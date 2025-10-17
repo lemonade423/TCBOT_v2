@@ -492,7 +492,7 @@ def rebuild_normalized_markdown(md_text: str, feature_hints: dict | None) -> tup
     return ("\n".join(parts).strip(), groups)
 
 # ────────────────────────────────────────────────
-# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (기존 유지)
+# [ADD] NEW: "함수명 분석 기반" 샘플 TC 생성기 (기존 유지)
 # ────────────────────────────────────────────────
 def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     stop = {
@@ -620,6 +620,92 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
     return pd.DataFrame(result, columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
 
 # ────────────────────────────────────────────────
+# [ADD] 동적 설명 생성을 위한 유틸
+# ────────────────────────────────────────────────
+def _extract_tc_suffix_range(df: pd.DataFrame) -> str:
+    # tc-<feature>-NNN 형식의 뒤 숫자 범위를 "001–00N"으로 표기
+    nums = []
+    for x in df["TC ID"].astype(str).tolist():
+        m = re.search(r"-(\d{3,4})$", x.strip())
+        if m:
+            try:
+                nums.append(int(m.group(1)))
+            except:
+                pass
+    if not nums:
+        return ""
+    return f"{min(nums):03d}–{max(nums):03d}"
+
+def _extract_endpoints(text: str) -> list[str]:
+    eps = set(re.findall(r"/[A-Za-z0-9_\-./]+", text))
+    # 너무 긴 경로/중복 정리
+    cleaned = sorted({e.strip().rstrip(".,)") for e in eps if len(e) <= 64})
+    return cleaned[:5]
+
+def _extract_methods(text: str) -> list[str]:
+    # 메서드/함수명 패턴 추출: name(  또는 Class.method(
+    methods = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
+    # 흔한 키워드/불용어 제거
+    stop = {"if","for","while","return","print","len","map","filter","sum","add","sub","div","is","get","set","post","put"}
+    filtered = sorted([m for m in methods if m.lower() not in stop])[:5]
+    return filtered
+
+def _classify_scenario_bucket(s: str) -> str:
+    s = s.lower()
+    # 간단 휴리스틱: 정상/예외/경계
+    if any(k in s for k in ["오류", "error", "예외", "invalid", "0으로", "zero", "null", "timeout", "권한", "401", "403", "404"]):
+        return "예외"
+    if any(k in s for k in ["경계", "boundary", "최대", "최소", "음수", "소수", "edge", "limit"]):
+        return "경계"
+    return "정상"
+
+def _priority_counts(df: pd.DataFrame) -> dict:
+    vals = df["우선순위"].astype(str).str.strip().str.title().tolist()
+    c = Counter(vals)
+    return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
+
+# [ADD] 실제로 화면에 넣을 동적 설명 마크다운 생성
+def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
+    if not groups:
+        return "_설명을 생성할 데이터가 없습니다._"
+
+    parts = []
+    for feature_name, df in groups.items():
+        # 텍스트 풀기
+        merged_text = " ".join(
+            df[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()
+        )
+        endpoints = _extract_endpoints(merged_text)
+        methods = _extract_methods(merged_text)
+        pr = _priority_counts(df)
+
+        # 시나리오 버킷
+        buckets = Counter()
+        for _, row in df.iterrows():
+            s = " ".join([str(row.get(c,"")) for c in ["기능 설명","입력값","예상 결과"]])
+            buckets[_classify_scenario_bucket(s)] += 1
+
+        rng = _extract_tc_suffix_range(df)
+        total = len(df)
+
+        # [FIX] 기능별 설명 문단(동적)
+        parts.append(f"#### {feature_name}  _(tc-…-{rng}, 총 {total}건)_")
+        bullet_lines = []
+        if endpoints:
+            bullet_lines.append(f"- **대상 엔드포인트**: {', '.join(endpoints)}")
+        if methods:
+            bullet_lines.append(f"- **주요 메서드/함수**: {', '.join(methods)}")
+        bullet_lines.append(f"- **시나리오 커버리지**: 정상 {buckets.get('정상',0)}건 · 예외 {buckets.get('예외',0)}건 · 경계 {buckets.get('경계',0)}건")
+        bullet_lines.append(f"- **우선순위 분포**: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
+        # 요약 한줄
+        focus_hint = "핵심/예외 위주 High 부여, 일반 시나리오 Medium, 낮은 영향 Low"  # 안내성(일반 규칙)
+        bullet_lines.append(f"- **요약**: 기능 요구를 중심으로 정상·예외·경계 상황을 포괄 검증합니다. ({focus_hint})")
+        parts.append("\n".join(bullet_lines))
+        parts.append("")  # spacing
+
+    return "\n".join(parts).strip()
+
+# ────────────────────────────────────────────────
 # 🧪 TAB 1: 소스코드 → 테스트케이스 자동 생성기
 # ────────────────────────────────────────────────
 with code_tab:
@@ -688,8 +774,7 @@ with code_tab:
                                 continue
 
                 # [FIX] 프롬프트 보강: 기능별 섹션 강제 + TCID 규칙 명시 + 힌트 제공
-                # (요청3 관련) 이전에는 "기능 섹션 외 불필요한 텍스트/설명은 넣지 말라."였으나,
-                # 설명 섹션 표시 요구가 있어 '설명' 금지 문구를 제거함.
+                # (요청3 관련) 설명 텍스트는 LLM 산출물 밖에서 동적 생성하므로, 프롬프트에는 표만 생성하도록 유지
                 feature_hints = st.session_state.get("feature_hints") or {}
                 hint_blocks = []
                 for key, toks in feature_hints.items():
@@ -745,7 +830,7 @@ with code_tab:
                 st.session_state.last_role = qa_role
                 st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: 헤더 문구 변경 + 설명 캡션 추가
+    # [FIX] 결과 표시: 헤더 문구 + 동적 설명 섹션
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
         # (요청1) 문구 변경
@@ -761,16 +846,20 @@ with code_tab:
         # 정규화된 원문(테이블들) 출력
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
-        # (요청3) 기능별 TC 생성 설명 블록을 테이블 아래에 추가
+        # [FIX] (요청3) 기능별 테이블을 기반으로 "설명"을 동적으로 생성하여 표시
         st.markdown("---")
         st.markdown("### 설명")
-        st.markdown(
-            "- **TC001–TC009**: `/health`와 `/sum` 엔드포인트의 동작을 테스트합니다. 정상 입력, 예외 처리, 음수 및 소수 포함한 다양한 시나리오를 고려했습니다.\n"
-            "- **TC010–TC015**: `CalcService` Java 클래스의 메서드들(`add`, `sub`, `isEven`)을 테스트합니다. 다양한 입력 조합(양수, 음수, 짝수/홀수)을 검토하여 메서드의 유효성을 확인합니다.\n"
-            "- **TC016–TC020**: `index.js`의 `sum` 함수를 테스트합니다. 정상 입력뿐만 아니라, 잘못된 입력(문자열)에 대한 예외 처리도 검증합니다.\n"
-            "- **우선순위 기준**: 시스템의 핵심 기능 및 주요 예외 처리는 **High**, 중요하지만 일반적인 시나리오(음수, 소수 처리 등)는 **Medium**, 음수 처리 등 예외적이고 비즈니스 중요도가 낮은 경우는 **Low**로 분류했습니다.\n\n"
-            "위 테스트 케이스는 기능별 테스트와 예외 처리를 철저히 확인하여 애플리케이션의 안정성을 보장합니다!"
-        )
+        try:
+            groups_for_desc = st.session_state.parsed_groups
+            if not groups_for_desc:
+                # 정규화 마크다운에서 재파싱 시도
+                md = st.session_state.get("normalized_markdown") or st.session_state.get("llm_result") or ""
+                groups_for_desc = group_tables_and_renumber(md)
+            dynamic_md = build_dynamic_explanations(groups_for_desc or {})
+            st.markdown(dynamic_md)
+        except Exception as _e:
+            st.caption("설명 생성 중 경고: 동적 요약에 실패하여 기본 안내만 표시합니다.")
+            st.markdown("_기능별 테이블을 기준으로 정상·예외·경계, 우선순위 분포를 요약합니다._")
 
     # [FIX] (요청4) 무슨 일이 있어도 '엑셀 다운로드' 버튼은 항상 표시
     # - 가능하면 parsed_groups/parsed_df로 내보내고,
