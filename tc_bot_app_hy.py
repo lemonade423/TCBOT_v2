@@ -627,24 +627,20 @@ def _normalize_priority_token(v: str) -> str:
     s = str(v or "").strip().lower()
     if not s:
         return ""
-    # 숫자/약어/국문 포함 매핑
     mapping = {
-        "1": "High", "h": "High", "high": "High", "높음": "High", "상": "High",
+        "1": "High", "h": "High", "high": "High", "높음": "High", "상": "High", "필수": "High", "critical": "High", "crit": "High",
         "2": "Medium", "m": "Medium", "med": "Medium", "medium": "Medium", "중간": "Medium", "보통": "Medium", "중": "Medium",
-        "3": "Low", "l": "Low", "low": "Low", "낮음": "Low", "하": "Low"
+        "3": "Low", "l": "Low", "low": "Low", "낮음": "Low", "하": "Low", "optional": "Low", "옵션": "Low"
     }
     return mapping.get(s, "High" if "high" in s else ("Medium" if "med" in s else ("Low" if "low" in s else "")))
 
 # [ADD] 행 단위 우선순위 추론
 def _infer_priority_from_text(text: str) -> str:
     s = (text or "").lower()
-    # 예외/치명 키워드 → High
     if any(k in s for k in ["zerodivision", "division by zero", "0으로", "error", "exception", "fatal", "권한", "unauthorized", "forbidden", "not found", "401", "403", "404", "timeout", "타임아웃", "invalid", "오류"]):
         return "High"
-    # 경계/부동소수/음수/최대최소 → Medium
     if any(k in s for k in ["경계", "boundary", "edge", "최대", "최소", "음수", "소수", "float", "overflow", "underflow"]):
         return "Medium"
-    # 기본 정상 → Medium(기본 검증 중요도)
     return "Medium"
 
 # [ADD] DF 전체에 대해 우선순위 정규화+추론 반영
@@ -671,7 +667,7 @@ def _priority_counts(df: pd.DataFrame) -> dict:
     return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
 
 # [ADD] 기능명 → 한국어 설명 휴리스틱
-def _feature_korean_desc(name: str) -> str:
+def _feature_korean_desc(name: str, fallback_from_rows: str = "") -> str:
     n = (name or "").lower()
     if any(k in n for k in ["add", "sum", "plus"]):
         return "두 개의 수를 더해 결과를 반환합니다."
@@ -681,31 +677,14 @@ def _feature_korean_desc(name: str) -> str:
         return "문자열이 유효한 이메일 형식인지 검사합니다."
     if "health" in n:
         return "헬스체크 엔드포인트의 가용성을 확인합니다."
-    return f"‘{name}’ 기능의 핵심 동작을 검증합니다."
-
-def _extract_tc_suffix_range(df: pd.DataFrame) -> str:
-    nums = []
-    for x in df["TC ID"].astype(str).tolist():
-        m = re.search(r"-(\d{3,4})$", x.strip())
-        if m:
-            try:
-                nums.append(int(m.group(1)))
-            except:
-                pass
-    if not nums:
-        return ""
-    return f"{min(nums):03d}–{max(nums):03d}"
+    # [ADD] 적절한 휴리스틱이 없을 경우, 첫 행의 기능 설명을 짧게 차용
+    fb = fallback_from_rows.strip()
+    return fb if fb else f"‘{name}’ 기능의 핵심 동작을 검증합니다."
 
 def _extract_endpoints(text: str) -> list[str]:
     eps = set(re.findall(r"/[A-Za-z0-9_\-./]+", text))
     cleaned = sorted({e.strip().rstrip(".,)") for e in eps if len(e) <= 64})
     return cleaned[:5]
-
-def _extract_methods(text: str) -> list[str]:
-    methods = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
-    stop = {"if","for","while","return","print","len","map","filter","sum","add","sub","div","is","get","set","post","put"}
-    filtered = sorted([m for m in methods if m.lower() not in stop])[:5]
-    return filtered
 
 def _classify_scenario_bucket(s: str) -> str:
     s = s.lower()
@@ -715,74 +694,51 @@ def _classify_scenario_bucket(s: str) -> str:
         return "경계"
     return "정상"
 
-# [FIX] 실제로 화면에 넣을 동적 설명 마크다운 생성 (과거 스타일 반영)
+# [FIX] 실제로 화면에 넣을 동적 설명 마크다운 생성
+#      (요청 반영) 출력 구성: 기능설명, 우선순위 분포, 요약  ― 그리고 헤더는 "Feature (총 N건)" 형태
 def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
     if not groups:
         return "_설명을 생성할 데이터가 없습니다._"
 
     parts = []
     for feature_name, df in groups.items():
-        # 우선순위 정규화 반영
         df_norm = _ensure_priorities(df)
 
-        merged_text = " ".join(
-            df_norm[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()
-        )
-        endpoints = _extract_endpoints(merged_text)
-        methods = _extract_methods(merged_text)
+        # 기능 설명: 휴리스틱 + 첫 행 보조
+        first_desc = str(df_norm.iloc[0]["기능 설명"]) if len(df_norm) else ""
+        func_desc = _feature_korean_desc(feature_name, fallback_from_rows=first_desc)
+
+        # 우선순위 분포
         pr = _priority_counts(df_norm)
 
-        # 시나리오 버킷
+        # 시나리오 성향(정상/예외/경계 비율)로 요약 문구 가변화
         buckets = Counter()
         for _, row in df_norm.iterrows():
             s = " ".join([str(row.get(c,"")) for c in ["기능 설명","입력값","예상 결과"]])
             buckets[_classify_scenario_bucket(s)] += 1
 
-        rng = _extract_tc_suffix_range(df_norm)
+        endpoints = _extract_endpoints(" ".join(df_norm[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()))
         total = len(df_norm)
 
-        # [ADD] 기능 설명(자연어) + 근거 문구(기능별로 상이)
-        func_desc = _feature_korean_desc(feature_name)
-        # 기능별 우선순위 근거 생성(내용 따라 변동)
-        reasons = []
+        # [FIX] 헤더 포맷 변경: "Div (총 3건)" 형태 (tc 범위 제거)
+        parts.append(f"#### {feature_name} (총 {total}건)")
+        parts.append(f"- **기능 설명**: {func_desc}")
+        parts.append(f"- **우선순위 분포**: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
+
+        # [FIX] 우선순위 정리 섹션 삭제 (요청 반영)
+
+        # [FIX] 요약(기능별 상황에 따라 다르게)
+        summary_bits = []
         if buckets.get("예외", 0) > 0:
-            reasons.append("예외 시나리오가 포함되어 시스템 안정성 측면에서 중요")
-        if any(k in ("/health " + " ".join(endpoints)) for k in ["/health"]):
-            reasons.append("가용성/모니터링 관점에서 핵심")
-        if any(k in feature_name.lower() for k in ["div", "divide"]):
-            reasons.append("0으로 나누기 등 치명 예외 처리 필요")
-        if any(k in feature_name.lower() for k in ["email", "isemail", "validator"]):
-            reasons.append("입력 검증 실패가 보안/품질에 영향")
-        if not reasons:
-            reasons.append("핵심 기능의 정확성과 예외 처리를 함께 검증")
-
-        # 헤더(과거 텍스트 느낌 유지)
-        parts.append(f"#### {feature_name}  _(tc-…-{rng}, 총 {total}건)_")
-        parts.append(f"**기능 설명:** {func_desc}")
-
-        # 엔드포인트/메서드가 있으면 참고 정보
+            summary_bits.append("예외 처리로 안정성 검증을 강화")
+        if buckets.get("경계", 0) > 0:
+            summary_bits.append("경계 입력을 포함해 견고성 확인")
         if endpoints:
-            parts.append(f"- 대상 엔드포인트: {', '.join(endpoints)}")
-        if methods:
-            parts.append(f"- 주요 메서드/함수: {', '.join(methods)}")
+            summary_bits.append("관련 엔드포인트 동작 일관성 확인")
+        if not summary_bits:
+            summary_bits.append("정상·경계 상황을 균형 있게 검증")
 
-        # 버킷/분포
-        parts.append(f"- 시나리오 커버리지: 정상 {buckets.get('정상',0)}건 · 예외 {buckets.get('예외',0)}건 · 경계 {buckets.get('경계',0)}건")
-        parts.append(f"- 우선순위 분포: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
-
-        # 우선순위 정리(과거 스타일)
-        parts.append("**우선순위 정리:**")
-        # 대표 규칙을 기능/버킷 기반으로 가변 서술
-        pr_lines = []
-        if buckets.get("예외",0) > 0:
-            pr_lines.append("- 예외/치명 케이스는 High로 분류")
-        if buckets.get("경계",0) > 0:
-            pr_lines.append("- 음수/소수/최대·최소 등 경계는 Medium 중심")
-        pr_lines.append("- 정상 시나리오는 기능의 중요도에 따라 Medium/Low로 분류")
-        parts.extend(pr_lines)
-
-        # 요약(기능별로 이유 포함)
-        parts.append(f"**요약:** {', '.join(reasons)}를 근거로 정상·예외·경계 전 범위를 검증하도록 구성했습니다.")
+        parts.append(f"- **요약**: {', '.join(summary_bits)}.")
         parts.append("")  # spacing
 
     return "\n".join(parts).strip()
@@ -911,7 +867,7 @@ with code_tab:
                 st.session_state.last_role = qa_role
                 st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: 헤더 문구 + 동적 설명 섹션(과거 스타일)
+    # [FIX] 결과 표시: 헤더 문구 + 동적 설명 섹션(요청 반영: 기능설명/우선순위 분포/요약만)
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
         # (요청1) 문구 변경
@@ -927,7 +883,7 @@ with code_tab:
         # 정규화된 원문(테이블들) 출력
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
-        # [FIX] 기능별 테이블을 기반으로 "설명"을 동적으로 생성하여 표시 (과거 텍스트 느낌 유지)
+        # [FIX] 설명: 기능설명/우선순위 분포/요약만 출력, 헤더는 "Feature (총 N건)"
         st.markdown("---")
         st.markdown("### 설명")
         try:
@@ -939,7 +895,7 @@ with code_tab:
             st.markdown(dynamic_md)
         except Exception as _e:
             st.caption("설명 생성 중 경고: 동적 요약에 실패하여 기본 안내만 표시합니다.")
-            st.markdown("_기능별 테이블을 기준으로 정상·예외·경계, 우선순위 분포를 요약합니다._")
+            st.markdown("_기능별 테이블을 기준으로 우선순위 분포와 요약을 제공합니다._")
 
     # [FIX] (요청4) 무슨 일이 있어도 '엑셀 다운로드' 버튼은 항상 표시
     excel_bytes = None
