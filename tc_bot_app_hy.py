@@ -946,10 +946,17 @@ with tc_tab:
     if st.button("🚀 명세서 생성하기", disabled=st.session_state["is_loading"]) and tc_file:
         st.session_state["is_loading"] = True
         try:
+            # [REQ] 여러 시트 지원: XLSX는 모든 시트를 읽어 세로 결합
             if tc_file.name.endswith("csv"):
                 df = pd.read_csv(tc_file)
             else:
-                df = pd.read_excel(tc_file)
+                sheets_dict = pd.read_excel(tc_file, sheet_name=None)  # 모든 시트 로드
+                frames = []
+                for sheet_name, sdf in sheets_dict.items():
+                    if isinstance(sdf, pd.DataFrame) and not sdf.empty:
+                        frames.append(sdf)
+                df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                
         except Exception as e:
             st.session_state["is_loading"] = False
             st.error(f"❌ 파일 읽기 실패: {e}")
@@ -964,8 +971,7 @@ with tc_tab:
 
             prompt = f"""
 너는 테스트케이스를 분석하여 그 기반이 되는 {summary_type}를 작성하는 QA 전문가이다.
-다음 테스트케이스들을 분석하여 기능명 또는 요구사항 제목과 함께, 설명과 목적을 자연어로 요약하라.
-테스트케이스가 기능 별로 분리되어 시트 구분이 되어있을 때는, 모든 시트를 참조하여 각 기능 별로 명세서를 생성해야 함.
+테스트케이스 파일이 여러 시트로 구성된 경우, **모든 시트의 내용을 종합적으로 참고하여** 아래 형식으로 요약하라.
 
 형식:
 - 기능명 또는 요구사항 제목
