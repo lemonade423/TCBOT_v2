@@ -338,7 +338,6 @@ def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
     tbls = _parse_md_tables_with_heading(md_text)
     if not tbls:
         return {}
-    # 1) 헤딩 존재/부재에 관계없이, 표 단위로 우선 분리
     groups: dict[str, pd.DataFrame] = {}
     unnamed_count = 0
     for (heading, df) in tbls:
@@ -370,7 +369,7 @@ def concat_groups_for_view(groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(view_rows, ignore_index=True)[["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"]]
 
 # ────────────────────────────────────────────────
-# [FIX] Auto-Preview(Sample TC) 생성기 — 다양성/중복방지 강화
+# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화 + 도메인형 TC ID 넘버링)
 # ────────────────────────────────────────────────
 def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     stop = {
@@ -390,141 +389,124 @@ def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     used_ids.add(tcid)
     return tcid
 
-# [FIX] 템플릿 다양화 + 결정적 변이(해시) + 중복방지 + 구체 입력/결과
 def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
-    # 분류
+    """
+    [FIX] 요구사항 반영:
+      - 1) distinct kind 기반 2~3건
+      - 2) 입력/예상결과 디테일 템플릿
+      - 3) TC ID: TC-<키워드>-### 형식으로 넘버링 부여
+      - ※ LLM 생성 TC ID에는 영향 없음 (본 함수는 Auto-Preview 전용)
+    """
+    rows = []
+    used_kinds = set()
+    used_ids = set()  # TC ID 중복 방지
+
+    def priority(kind: str) -> str:
+        high = {"div", "auth", "write", "delete", "io", "validate"}
+        return "High" if kind in high else "Medium"
+
+    def templates_for_kind(kind: str, fn: str):
+        fn_disp = fn
+        if kind == "add":
+            return [
+                (f"{fn_disp} 정상 합산", "a=10, b=20 (정상값)", "30 반환"),
+                (f"{fn_disp} 합산 경계값", "a=-1, b=1 (음수+양수)", "오버플로우/언더플로우 없이 0 반환")
+            ]
+        if kind == "div":
+            return [
+                (f"{fn_disp} 정상 나눗셈", "a=6, b=3 (정상값)", "2 반환(정수/실수 처리 일관)"),
+                (f"{fn_disp} 0 나눗셈 예외", "a=1, b=0 (비정상)", "ZeroDivisionError 또는 400/예외 코드")
+            ]
+        if kind == "read":
+            return [
+                (f"{fn_disp} 유효 조회", "id=1 (존재)", "정상 데이터 반환(HTTP 200/OK)"),
+                (f"{fn_disp} 미존재 조회", "id=999999 (미존재)", "404/빈 결과 반환")
+            ]
+        if kind == "write":
+            return [
+                (f"{fn_disp} 유효 쓰기", "payload={'name':'A','value':1}", "201/성공 및 영속 반영"),
+                (f"{fn_disp} 필수값 누락", "payload={'value':1} (name 누락)", "400/검증 오류 메시지")
+            ]
+        if kind == "delete":
+            return [
+                (f"{fn_disp} 유효 삭제", "id=1 (존재)", "삭제 성공 및 재조회 시 미존재"),
+                (f"{fn_disp} 중복/미존재 삭제", "id=999999 (미존재)", "404 또는 멱등 처리")
+            ]
+        if kind == "auth":
+            return [
+                (f"{fn_disp} 유효 토큰 접근", "Bearer 유효토큰", "200/권한 허용"),
+                (f"{fn_disp} 만료/위조 토큰", "Bearer 만료/위조 토큰", "401/403 접근 거부")
+            ]
+        if kind == "validate":
+            return [
+                (f"{fn_disp} 이메일 유효성(정상)", "s='user@example.com'", "True/허용"),
+                (f"{fn_disp} 이메일 유효성(이상)", "s='invalid@domain'", "False/422 또는 검증 실패")
+            ]
+        if kind == "io":
+            return [
+                (f"{fn_disp} 업로드/다운로드 성공", "파일=1MB, timeout=5s", "성공/정상 응답, 무결성 유지"),
+                (f"{fn_disp} 네트워크 타임아웃", "timeout=1s (지연 환경)", "재시도 or 타임아웃 오류 처리")
+            ]
+        return [
+            (f"{fn_disp} 기본 정상 동작", "표준 입력 1세트(정상)", "성공 코드/정상 반환"),
+            (f"{fn_disp} 비정상 입력 처리", "필수값 누락 또는 타입 불일치", "명확한 오류 메시지/코드 반환")
+        ]
+
     def classify(fn: str) -> str:
         s = fn.lower()
-        if any(k in s for k in ["add","sum","plus"]): return "add"
-        if any(k in s for k in ["div","divide"]): return "div"
-        if any(k in s for k in ["get","fetch","load","read","list","find"]): return "read"
-        if any(k in s for k in ["save","create","update","insert","post","put","patch"]): return "write"
-        if any(k in s for k in ["delete","remove"]): return "delete"
-        if any(k in s for k in ["auth","login","signin","verify","token","oauth","jwt"]): return "auth"
-        if any(k in s for k in ["email","validate","regex","check","phone","url"]): return "validate"
-        if any(k in s for k in ["upload","download","request","client","socket","stream","io"]): return "io"
+        if any(k in s for k in ["add", "sum", "plus"]): return "add"
+        if any(k in s for k in ["div", "divide"]): return "div"
+        if any(k in s for k in ["get", "fetch", "load", "read"]): return "read"
+        if any(k in s for k in ["save", "create", "update", "insert", "post", "put"]): return "write"
+        if any(k in s for k in ["delete", "remove"]): return "delete"
+        if any(k in s for k in ["auth", "login", "signin", "verify", "token"]): return "auth"
+        if any(k in s for k in ["email", "validate", "regex", "check"]): return "validate"
+        if any(k in s for k in ["upload", "download", "request", "client", "socket"]): return "io"
         return "default"
 
-    # [ADD] 각 kind별 다양한 시나리오(입력/예상결과를 구체적으로)
-    TEMPLATE_POOL = {
-        "add": [
-            ("{fn} 정상 합산", "a=10, b=20", "30 반환"),
-            ("{fn} 음수/양수 혼합", "a=-5, b=8", "3 반환"),
-            ("{fn} 실수 합산", "a=0.1, b=0.2", "부동소수 오차 허용 범위 내 0.3"),
-            ("{fn} 대용량 정수", "a=10**9, b=10**9", "2*10**9 반환/오버플로우 없음"),
-        ],
-        "div": [
-            ("{fn} 정상 나눗셈", "a=9, b=3", "3 반환"),
-            ("{fn} 0 나눗셈 예외", "a=1, b=0", "ZeroDivisionError/HTTP 400"),
-            ("{fn} 실수 나눗셈", "a=1, b=4", "0.25 반환(반올림 정책 확인)"),
-        ],
-        "read": [
-            ("{fn} 페이지네이션 조회", "page=1, size=20", "20건 반환 및 next 링크 포함"),
-            ("{fn} 필터 조건 조회", "status='ACTIVE'", "상태 일치 레코드만 반환"),
-            ("{fn} 존재하지 않는 키", "id=999999", "404/빈 결과"),
-        ],
-        "write": [
-            ("{fn} 신규 생성", "payload={'name':'A','value':1}", "201/ID 발급 & 영속"),
-            ("{fn} 필수값 누락", "payload={'value':1}", "400/필수 필드 누락 메시지"),
-            ("{fn} 중복 키 처리", "payload={'id':1,'name':'dup'}", "409/중복 충돌"),
-        ],
-        "delete": [
-            ("{fn} 정상 삭제", "id=1 (존재)", "204/재조회 시 미존재"),
-            ("{fn} 미존재 삭제", "id=999999", "404 또는 멱등 처리"),
-        ],
-        "auth": [
-            ("{fn} 유효 토큰", "Authorization='Bearer VALID.JWT'", "200/권한 허용"),
-            ("{fn} 만료 토큰", "Authorization='Bearer EXPIRED.JWT'", "401/토큰 만료"),
-            ("{fn} 권한 부족", "Authorization='Bearer NO_SCOPE'", "403/권한 부족"),
-        ],
-        "validate": [
-            ("{fn} 이메일 정상", "s='user@example.com'", "True 반환"),
-            ("{fn} 이메일 이상", "s='no-at-symbol'", "False/규칙 위반"),
-            ("{fn} URL 검증", "s='https://example.com/path?x=1'", "True/허용"),
-            ("{fn} 전화번호 검증", "s='+82-10-1234-5678'", "지역 규칙에 맞게 True/False"),
-        ],
-        "io": [
-            ("{fn} 업로드 성공", "file=1MB, timeout=5s", "200/무결성 해시 일치"),
-            ("{fn} 다운로드 지연", "timeout=1s (지연 환경)", "타임아웃 후 재시도/백오프"),
-            ("{fn} 스트림 중단", "연결 강제 종료", "부분 수신 처리 및 복구 로직"),
-        ],
-        "default": [
-            ("{fn} 정상 시나리오", "유효 파라미터 1세트", "성공 코드/정상 반환"),
-            ("{fn} 경계/비정상", "필수값 누락/타입 불일치", "명확한 오류 메시지/코드"),
-        ]
-    }
-
-    used_ids: set[str] = set()
-    used_titles: set[str] = set()
-    rows: list[list[str]] = []
-    kinds_added: set[str] = set()
-
-    # 결정적 인덱스 선택(랜덤 금지, 함수명 해시 기반)
-    def pick_indices(fn: str, pool_len: int, want: int = 2) -> list[int]:
-        if pool_len == 0: return []
-        # sha1 해시로 변이, 충돌 줄임
-        h = int(sha1(fn.encode("utf-8")).hexdigest(), 16)
-        base = h % pool_len
-        step = max(1, (h // 997) % pool_len)
-        idxs = []
-        cur = base
-        for _ in range(want * 3):  # 여유 루프로 중복 피하기
-            if cur not in idxs:
-                idxs.append(cur)
-                if len(idxs) >= want:
-                    break
-            cur = (cur + step) % pool_len
-        return idxs[:want]
-
-    seq = 1
+    # ➊ distinct kind 기준으로 최대 3건 수집 (TC ID에 넘버링 부여)
+    candidates = []
+    seq_counter = 1  # [FIX] TC ID 넘버링 시작
     for fn in top_functions:
         kind = classify(fn)
-        if kind in kinds_added:
+        if kind in used_kinds:
             continue
-        pool = TEMPLATE_POOL.get(kind, TEMPLATE_POOL["default"])
-        # 함수명을 템플릿에 주입하고, 해시 기반으로 서로 다른 1~2개 선택
-        want_cnt = 2 if kind in {"add","div","write","auth"} else 1
-        indices = pick_indices(fn, len(pool), want=want_cnt)
-        added_local = 0
-        for i in indices:
-            title_t, inp_t, exp_t = pool[i]
-            title = title_t.format(fn=fn)
-            if title in used_titles:
-                continue
-            tcid = make_tc_id_from_fn(fn, used_ids, seq)
-            seq += 1
-            rows.append([tcid, title, inp_t, exp_t, "High" if kind in {"div","auth","write","delete","io","validate"} else "Medium"])
-            used_titles.add(title)
-            added_local += 1
-            if len(rows) >= 3:
-                break
-        if added_local > 0:
-            kinds_added.add(kind)
-        if len(rows) >= 3:
+        used_kinds.add(kind)
+        title, inp, exp = templates_for_kind(kind, fn)[0]
+        tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] TC-<Base>-### 부여
+        seq_counter += 1
+        candidates.append([kind, fn, tcid, title, inp, exp, priority(kind)])
+        if len(candidates) >= 3:
             break
 
-    # 후보가 부족하면 보강(기본/경계 조합) — 단, 모호 표현 금지
-    if len(rows) == 0:
-        tc1 = make_tc_id_from_fn("Bootstrap_Init", used_ids, 1)
-        tc2 = make_tc_id_from_fn("CorePath_Error", used_ids, 2)
-        rows = [
-            [tc1, "애플리케이션 부팅 경로 확인", "config=default.yaml, ENV=dev", "초기 화면 렌더/로그인 버튼 노출", "Medium"],
-            [tc2, "핵심 경로 오류 처리", "payload={'id':None}", "400/필수 필드 누락 메시지", "High"],
+    # ➋ 결과 구성 (2~3건 보장, 서로 다른 케이스, 넘버링 지속)
+    result = []
+    if len(candidates) >= 3:
+        for c in candidates[:3]:
+            kind, fn, tcid, title, inp, exp, pr = c
+            result.append([tcid, title, inp, exp, pr])
+    elif len(candidates) == 2:
+        for c in candidates:
+            kind, fn, tcid, title, inp, exp, pr = c
+            result.append([tcid, title, inp, exp, pr])
+    elif len(candidates) == 1:
+        kind, fn, _, _, _, _, pr = candidates[0]
+        t_list = templates_for_kind(kind, fn)
+        # 두 개 템플릿을 서로 다른 ID로 (넘버링 이어서)
+        for (title, inp, exp) in t_list[:2]:
+            tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] 같은 base에 다른 ### 부여
+            seq_counter += 1
+            result.append([tcid, title, inp, exp, pr])
+    else:
+        # 함수가 전혀 없는 경우: 기본 2건 (서로 다른 ID, 넘버링 부여)
+        tcid1 = make_tc_id_from_fn("Bootstrap_Init", used_ids, seq=1)
+        tcid2 = make_tc_id_from_fn("CorePath_Error", used_ids, seq=2)
+        result = [
+            [tcid1, "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
+            [tcid2, "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
         ]
-    elif len(rows) == 1:
-        # 하나일 때는 동일 kind 템플릿에서 다른 케이스 추가(중복검사 포함)
-        fn = top_functions[0] if top_functions else "DefaultCase"
-        kind = classify(fn)
-        pool = TEMPLATE_POOL.get(kind, TEMPLATE_POOL["default"])
-        for i, (title_t, inp_t, exp_t) in enumerate(pool):
-            title = title_t.format(fn=fn)
-            if title in used_titles:
-                continue
-            tcid = make_tc_id_from_fn(fn, used_ids, seq); seq += 1
-            rows.append([tcid, title, inp_t, exp_t, "High" if kind in {"div","auth","write","delete","io","validate"} else "Medium"])
-            break
 
-    return pd.DataFrame(rows[:3], columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
+    return pd.DataFrame(result, columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
 
 # ────────────────────────────────────────────────
 # 🧪 TAB 1: 소스코드 → 테스트케이스 자동 생성기
@@ -624,22 +606,17 @@ with code_tab:
             result = response.json()["choices"][0]["message"]["content"]
             st.session_state.llm_result = result
 
-            # [FIX] ▼ 기능 분리 보강: 1) 표+헤딩 분리 시도 → 2) 실패 시 단일 DF 강제 분리 ▼
+            # [FIX] ▼ 기능 분리 파이프라인: 결과를 “하나의 최종 결과”로 표준화 (표시도 이 결과만) ▼
             try:
                 tbl_with_heading = _parse_md_tables_with_heading(result)
+                groups = {}
                 if tbl_with_heading:
-                    # 표가 여러 개인 경우: 표 단위로 분리(헤딩 유무와 무관)
+                    # 표가 여러 개인 경우: 각 표를 기능 단위로 보존(헤딩 유무와 무관)
                     groups = group_tables_and_renumber(result)
-                else:
-                    # 표 파싱이 아예 안 되었을 때: 파이프 라인/CSV 등은 기존 로직을 건드리지 않음
-                    groups = {}
-
-                # 단일 표/분리 실패 시: TCID prefix/기능설명 키워드로 강제 분할
-                if not groups and tbl_with_heading:
-                    # tbl_with_heading에 1개만 있는 경우
-                    single_df = tbl_with_heading[0][1]
-                    groups = split_single_df(single_df)
-
+                    # 단일 표 등으로 실패 시 보조 분리
+                    if not groups and len(tbl_with_heading) == 1:
+                        groups = split_single_df(tbl_with_heading[0][1])
+                # 파싱이 아예 안 될 경우 groups는 비어둘 수 있음
                 st.session_state.parsed_groups = groups if groups else None
                 st.session_state.parsed_df = concat_groups_for_view(groups) if groups else None
             except Exception:
@@ -652,17 +629,20 @@ with code_tab:
             st.session_state.last_role = qa_role
         st.session_state["is_loading"] = False
 
-    # 결과 표시(원문 + 기능별 표 미리보기)
-    if st.session_state.llm_result:
-        st.success("✅ 테스트케이스 생성 완료!")
-        st.markdown("## 📋 생성된 테스트케이스 (LLM 원문)")
-        st.markdown(st.session_state.llm_result)
-
+    # [FIX] 결과 표시: “LLM 원문” 대신, 후처리된 최종 결과만 노출 (요구사항2)
     if st.session_state.parsed_groups:
-        st.markdown("## 📦 기능별 테스트케이스 (테이블 분리 + 기능별 ID 재넘버링 반영)")
+        st.success("✅ 테스트케이스 생성 완료!")
+        st.markdown("## 📋 생성된 테스트케이스 (기능별 분리 + ID 정규화 반영)")
         for key, df in st.session_state.parsed_groups.items():
             st.markdown(f"#### 기능: `{key}`")
             st.dataframe(df, use_container_width=True)
+        # [ADD] 원문은 참고용으로만 접기
+        with st.expander("🧾 (옵션) LLM 원문 보기"):
+            st.markdown(st.session_state.llm_result)
+    elif st.session_state.llm_result:
+        # 파싱 실패 시 원문만 표시(기존 폴백)
+        st.warning("⚠️ 후처리 분리에 실패하여 원문을 표시합니다. (표 형식을 확인하세요)")
+        st.markdown(st.session_state.llm_result)
 
     # [FIX] 엑셀 다운로드: 기능별 '시트' 분리(시트명=기능명). 그룹 없으면 단일 시트 폴백.
     if (st.session_state.parsed_groups or st.session_state.parsed_df is not None) and not need_llm_call(
