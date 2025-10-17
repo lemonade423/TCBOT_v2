@@ -183,7 +183,6 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
 
             for n in names:
                 if n.endswith("/"):
-                    # 상위 디렉터리명을 기능 후보로
                     first = n.strip("/").split("/")[0]
                     if first:
                         feature_keys.add(_norm_key(first))
@@ -195,7 +194,7 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
                 ext = os.path.splitext(n)[1].lower()
                 stem = os.path.splitext(os.path.basename(n))[0]
                 if stem:
-                    feature_keys.add(_norm_key(stem))  # 파일명도 후보
+                    feature_keys.add(_norm_key(stem))
 
                 if ext in lang_map:
                     lang_counts[lang_map[ext]] += 1
@@ -203,14 +202,12 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
                 try:
                     with zf.open(n) as fh:
                         content = fh.read(100_000).decode("utf-8", errors="ignore")
-                        # 함수/메서드
                         for pat in [
                             r"def\s+([a-zA-Z_]\w*)\s*\(",
                             r"function\s+([a-zA-Z_]\w*)\s*\(",
                             r"(?:public|private|protected)?\s*(?:static\s+)?[A-Za-z_<>\[\]]+\s+([a-zA-Z_]\w*)\s*\("
                         ]:
                             top_functions += re.findall(pat, content)
-                        # 클래스
                         for cpat in [
                             r"class\s+([A-Z][A-Za-z0-9_]*)",
                             r"(?:public|final|abstract)\s+class\s+([A-Z][A-Za-z0-9_]*)"
@@ -219,7 +216,6 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
                 except Exception:
                     pass
 
-        # 클래스/함수명도 기능 후보
         for name in classes[:80]:
             feature_keys.add(_norm_key(name))
         for fn in top_functions[:120]:
@@ -228,7 +224,6 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
     except zipfile.BadZipFile:
         pass
 
-    # 너무 일반적인 키 제거
     generic = {"app","main","index","core","utils","common","service","controller","model","routes","handler","api","src","test","tests"}
     feature_keys = {k for k in feature_keys if k and k not in generic}
 
@@ -238,9 +233,8 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
         "top_functions": top_functions[:200],
         "module_counts": module_counts,
         "sample_paths": sample_paths,
-        # [ADD]
         "classes": classes[:200],
-        "feature_keys": sorted(feature_keys)[:40],  # 프롬프트 부담 완화
+        "feature_keys": sorted(feature_keys)[:40],
     }
 
 def estimate_tc_count(stats: dict) -> int:
@@ -298,7 +292,6 @@ def _md_table_to_df(table_str: str) -> pd.DataFrame | None:
     raw = [r for r in table_str.splitlines() if r.strip()]
     if len(raw) < 2:
         return None
-
     headers = [h.strip() for h in raw[0].strip("|").split("|")]
     data_lines = [r for r in raw[2:]]
     rows = []
@@ -344,7 +337,6 @@ def _normalize_feature_key(name: str, sample_row: dict | None = None) -> tuple[s
             tks = re.findall(r"[A-Za-z][A-Za-z0-9]+", feat)
             if tks:
                 key = "".join(tks[:2])
-
     key = key or "General"
     sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key).strip()
     key_id = re.sub(r"[^A-Za-z0-9 ]", "", sheet).strip().lower().replace(" ", "-") or "general"
@@ -356,40 +348,31 @@ def _extract_prefix_from_tcid(tcid: str) -> str | None:
         return m.group(1).lower()
     return None
 
-# [ADD] 기능 힌트(aliases) 생성: 각 key에 대해 파일명/클래스/함수 파생 토큰 포함
+# [ADD] 기능 힌트(aliases) 생성
 def build_feature_hints(stats: dict) -> dict:
     keys = stats.get("feature_keys", []) or []
     aliases = defaultdict(set)
-
-    # 원 키
     for k in keys:
         aliases[k].add(k)
         aliases[k].add(k.replace("-", ""))
-
-    # 파일/클래스/함수에서 파생 토큰
     for name in (stats.get("classes") or []) + (stats.get("top_functions") or []):
         norm = _norm_key(name)
         if not norm:
             continue
-        # 가장 유사한 키에 매핑(간단: 접두 일치/부분 일치)
         target = None
         for k in keys:
             if norm.startswith(k) or k.startswith(norm) or norm.replace("-","") in k.replace("-",""):
                 target = k; break
         if target:
             aliases[target].update({norm, norm.replace("-", ""), name.lower()})
-
-    # 디렉터리/파일 기반 키(이미 analyze에서 넣었음)
     return {k: sorted(v) for k, v in aliases.items()}
 
 # [ADD] 힌트 기반 행→기능 키 추정
 def _infer_key_from_row_with_hints(row: pd.Series, hints: dict) -> str:
     text = " ".join([str(row.get(c,"")) for c in ["TC ID","기능 설명","입력값","예상 결과"]]).lower()
-    # TCID 접두 우선
     pref = _extract_prefix_from_tcid(str(row.get("TC ID","")))
     if pref:
         return pref
-    # 힌트 토큰 스캔
     best_key, best_hits = None, 0
     for key, toks in hints.items():
         hits = 0
@@ -418,7 +401,6 @@ def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
         return {}
     groups: dict[str, pd.DataFrame] = {}
     unnamed_count = 0
-
     for (heading, df) in tbls:
         df_norm = _normalize_headers(df).fillna("")
         sample_row = df_norm.iloc[0].to_dict() if len(df_norm) else {}
@@ -456,173 +438,7 @@ def _df_to_md_table(df: pd.DataFrame) -> str:
         rows.append("| " + " | ".join(str(r[c]) for c in use_cols) + " |")
     return "\n".join([header, sep] + rows)
 
-# [FIX] 핵심: 원문을 기능별 + ID정규화 ‘원문형식’으로 재구성 (힌트 기반 강제 분리 포함)
-def rebuild_normalized_markdown(md_text: str, feature_hints: dict | None) -> tuple[str, dict[str, pd.DataFrame]]:
-    groups = group_tables_and_renumber(md_text)
-    if not groups:
-        tbls = _parse_md_tables_with_heading(md_text)
-        if tbls:
-            # 단일 테이블이거나 헤딩 매핑 실패 → 힌트 기반 강제 분리
-            base_df = _normalize_headers(tbls[0][1])
-            hints = feature_hints or {}
-            groups = split_single_df_feature_aware(base_df, hints)
-        else:
-            return (md_text, {})
-
-    # 원문 순서 보존
-    ordered = []
-    tbls2 = _parse_md_tables_with_heading(md_text)
-    seen = set()
-    for (heading, df) in tbls2:
-        sheet_name, key_id = _normalize_feature_key(heading, df.iloc[0].to_dict() if len(df) else None)
-        candidates = [k for k in groups.keys() if k.startswith(sheet_name)]
-        name = candidates[0] if candidates else sheet_name
-        if name in groups and name not in seen:
-            ordered.append(name); seen.add(name)
-    for name in groups.keys():
-        if name not in seen:
-            ordered.append(name)
-
-    parts = []
-    for name in ordered:
-        df = groups[name]
-        parts.append(f"## {name}")
-        parts.append(_df_to_md_table(df))
-        parts.append("")
-    return ("\n".join(parts).strip(), groups)
-
-# ────────────────────────────────────────────────
-# [ADD] NEW: "함수명 분석 기반" 샘플 TC 생성기 (기존 유지)
-# ────────────────────────────────────────────────
-def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
-    stop = {
-        "get","set","is","has","have","do","make","build","create","update","insert","delete","remove","fetch","load","read","write",
-        "put","post","patch","calc","compute","process","handle","run","exec","call","check","validate","convert","parse","format",
-        "test","temp","main","init","start","stop","open","close","send","receive","retry","download","upload","save","add","sum","plus","div","divide"
-    }
-    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", fn).replace("_"," ")
-    words = [w for w in re.findall(r"[A-Za-z]+", s) if w.lower() not in stop] or re.findall(r"[A-Za-z]+", s)[:2]
-    base = "".join(w.capitalize() for w in words[:3])
-    base = re.sub(r"[^A-Za-z0-9]", "", base) or "Auto"
-    n = 1 if seq is None else seq
-    tcid = f"TC-{base}-{n:03d}"
-    while tcid in used_ids:
-        n += 1
-        tcid = f"TC-{base}-{n:03d}"
-    used_ids.add(tcid)
-    return tcid
-
-def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
-    rows = []
-    used_kinds = set()
-    used_ids = set()
-
-    def priority(kind: str) -> str:
-        high = {"div", "auth", "write", "delete", "io", "validate"}
-        return "High" if kind in high else "Medium"
-
-    def templates_for_kind(kind: str, fn: str):
-        fn_disp = fn
-        if kind == "add":
-            return [
-                (f"{fn_disp} 정상 합산", "a=10, b=20 (정상값)", "30 반환"),
-                (f"{fn_disp} 합산 경계값", "a=-1, b=1 (음수+양수)", "오버플로우/언더플로우 없이 0 반환")
-            ]
-        if kind == "div":
-            return [
-                (f"{fn_disp} 정상 나눗셈", "a=6, b=3 (정상값)", "2 반환(정수/실수 처리 일관)"),
-                (f"{fn_disp} 0 나눗셈 예외", "a=1, b=0 (비정상)", "ZeroDivisionError 또는 400/예외 코드")
-            ]
-        if kind == "read":
-            return [
-                (f"{fn_disp} 유효 조회", "id=1 (존재)", "정상 데이터 반환(HTTP 200/OK)"),
-                (f"{fn_disp} 미존재 조회", "id=999999 (미존재)", "404/빈 결과 반환")
-            ]
-        if kind == "write":
-            return [
-                (f"{fn_disp} 유효 쓰기", "payload={'name':'A','value':1}", "201/성공 및 영속 반영"),
-                (f"{fn_disp} 필수값 누락", "payload={'value':1} (name 누락)", "400/검증 오류 메시지")
-            ]
-        if kind == "delete":
-            return [
-                (f"{fn_disp} 유효 삭제", "id=1 (존재)", "삭제 성공 및 재조회 시 미존재"),
-                (f"{fn_disp} 중복/미존재 삭제", "id=999999 (미존재)", "404 또는 멱등 처리")
-            ]
-        if kind == "auth":
-            return [
-                (f"{fn_disp} 유효 토큰 접근", "Bearer 유효토큰", "200/권한 허용"),
-                (f"{fn_disp} 만료/위조 토큰", "Bearer 만료/위조 토큰", "401/403 접근 거부")
-            ]
-        if kind == "validate":
-            return [
-                (f"{fn_disp} 이메일 유효성(정상)", "s='user@example.com'", "True/허용"),
-                (f"{fn_disp} 이메일 유효성(이상)", "s='invalid@domain'", "False/422 또는 검증 실패")
-            ]
-        if kind == "io":
-            return [
-                (f"{fn_disp} 업로드/다운로드 성공", "파일=1MB, timeout=5s", "성공/정상 응답, 무결성 유지"),
-                (f"{fn_disp} 네트워크 타임아웃", "timeout=1s (지연 환경)", "재시도 or 타임아웃 오류 처리")
-            ]
-        return [
-            (f"{fn_disp} 기본 정상 동작", "표준 입력 1세트(정상)", "성공 코드/정상 반환"),
-            (f"{fn_disp} 비정상 입력 처리", "필수값 누락 또는 타입 불일치", "명확한 오류 메시지/코드 반환")
-        ]
-
-    def classify(fn: str) -> str:
-        s = fn.lower()
-        if any(k in s for k in ["add", "sum", "plus"]): return "add"
-        if any(k in s for k in ["div", "divide"]): return "div"
-        if any(k in s for k in ["get", "fetch", "load", "read"]): return "read"
-        if any(k in s for k in ["save", "create", "update", "insert", "post", "put"]): return "write"
-        if any(k in s for k in ["delete", "remove"]): return "delete"
-        if any(k in s for k in ["auth", "login", "signin", "verify", "token"]): return "auth"
-        if any(k in s for k in ["email", "validate", "regex", "check"]): return "validate"
-        if any(k in s for k in ["upload", "download", "request", "client", "socket"]): return "io"
-        return "default"
-
-    candidates = []
-    seq_counter = 1
-    for fn in top_functions:
-        kind = classify(fn)
-        if kind in used_kinds:
-            continue
-        used_kinds.add(kind)
-        title, inp, exp = templates_for_kind(kind, fn)[0]
-        tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)
-        seq_counter += 1
-        candidates.append([kind, fn, tcid, title, inp, exp, priority(kind)])
-        if len(candidates) >= 3:
-            break
-
-    result = []
-    if len(candidates) >= 3:
-        for c in candidates[:3]:
-            kind, fn, tcid, title, inp, exp, pr = c
-            result.append([tcid, title, inp, exp, pr])
-    elif len(candidates) == 2:
-        for c in candidates:
-            kind, fn, tcid, title, inp, exp, pr = c
-            result.append([tcid, title, inp, exp, pr])
-    elif len(candidates) == 1:
-        kind, fn, _, _, _, _, pr = candidates[0]
-        t_list = templates_for_kind(kind, fn)
-        for (title, inp, exp) in t_list[:2]:
-            tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)
-            seq_counter += 1
-            result.append([tcid, title, inp, exp, pr])
-    else:
-        tcid1 = make_tc_id_from_fn("Bootstrap_Init", used_ids, seq=1)
-        tcid2 = make_tc_id_from_fn("CorePath_Error", used_ids, seq=2)
-        result = [
-            [tcid1, "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
-            [tcid2, "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
-        ]
-    return pd.DataFrame(result, columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
-
-# ────────────────────────────────────────────────
-# [ADD] 동적 설명 생성을 위한 유틸 (우선순위 정규화/추론 포함)
-# ────────────────────────────────────────────────
-# [ADD] 우선순위 토큰 정규화
+# [FIX] 우선순위 정규화/추론
 def _normalize_priority_token(v: str) -> str:
     s = str(v or "").strip().lower()
     if not s:
@@ -634,7 +450,6 @@ def _normalize_priority_token(v: str) -> str:
     }
     return mapping.get(s, "High" if "high" in s else ("Medium" if "med" in s else ("Low" if "low" in s else "")))
 
-# [ADD] 행 단위 우선순위 추론
 def _infer_priority_from_text(text: str) -> str:
     s = (text or "").lower()
     if any(k in s for k in ["zerodivision", "division by zero", "0으로", "error", "exception", "fatal", "권한", "unauthorized", "forbidden", "not found", "401", "403", "404", "timeout", "타임아웃", "invalid", "오류"]):
@@ -643,7 +458,6 @@ def _infer_priority_from_text(text: str) -> str:
         return "Medium"
     return "Medium"
 
-# [ADD] DF 전체에 대해 우선순위 정규화+추론 반영
 def _ensure_priorities(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df.copy()
     if "우선순위" not in df2.columns:
@@ -659,28 +473,13 @@ def _ensure_priorities(df: pd.DataFrame) -> pd.DataFrame:
     df2["우선순위"] = norm_vals
     return df2
 
-# [FIX] 우선순위 분포 계산: 정규화/추론 이후 카운트
 def _priority_counts(df: pd.DataFrame) -> dict:
     df2 = _ensure_priorities(df)
     vals = df2["우선순위"].astype(str).str.strip().str.title().tolist()
     c = Counter(vals)
     return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
 
-# [ADD] 기능명 → 한국어 설명 휴리스틱
-def _feature_korean_desc(name: str, fallback_from_rows: str = "") -> str:
-    n = (name or "").lower()
-    if any(k in n for k in ["add", "sum", "plus"]):
-        return "두 개의 수를 더해 결과를 반환합니다."
-    if any(k in n for k in ["div", "divide"]):
-        return "두 수를 나누어 결과를 반환하며, 0으로 나누는 경우 예외가 발생합니다."
-    if any(k in n for k in ["email", "isemail", "validator", "validate"]):
-        return "문자열이 유효한 이메일 형식인지 검사합니다."
-    if "health" in n:
-        return "헬스체크 엔드포인트의 가용성을 확인합니다."
-    # [ADD] 적절한 휴리스틱이 없을 경우, 첫 행의 기능 설명을 짧게 차용
-    fb = fallback_from_rows.strip()
-    return fb if fb else f"‘{name}’ 기능의 핵심 동작을 검증합니다."
-
+# [ADD] 보조 추출기
 def _extract_endpoints(text: str) -> list[str]:
     eps = set(re.findall(r"/[A-Za-z0-9_\-./]+", text))
     cleaned = sorted({e.strip().rstrip(".,)") for e in eps if len(e) <= 64})
@@ -694,8 +493,63 @@ def _classify_scenario_bucket(s: str) -> str:
         return "경계"
     return "정상"
 
+# [ADD] 핵심: 이름+내용 기반 기능 설명 생성기 (처음 보는 함수도 소스/TC 텍스트로 추론)
+def _feature_desc_from_name_and_content(name: str, merged_text: str) -> str:
+    n = (name or "").lower()
+    t = (merged_text or "").lower()
+
+    # 공통 키워드
+    has_json = any(k in t for k in ["json", "application/json", "{", "}", "직렬화", "serialize", "deserialize"])
+    has_health = "/health" in t or "health" in n
+    has_sum = any(k in (n + " " + t) for k in ["sum", "add", "덧셈", "합계", "합산"])
+    has_sub = any(k in (n + " " + t) for k in ["sub", "subtract", "차감", "감산"])
+    has_email = any(k in (n + " " + t) for k in ["email", "이메일"])
+    has_file = any(k in (n + " " + t) for k in ["file", "파일"])
+    has_write = any(k in (n + " " + t) for k in ["write", "쓰기", "저장"])
+    has_read = any(k in (n + " " + t) for k in ["read", "읽기", "load"])
+    has_encoding = any(k in t for k in ["euc-kr", "utf-8", "charset"])
+    has_https = any(k in (n + " " + t) for k in ["httpsurlconnection", "https", "ssl", "tls"])
+    has_stream = any(k in (n + " " + t) for k in ["bytearrayoutputstream", "inputstream", "stream"])
+    has_alarm = any(k in (n + " " + t) for k in ["alarm", "알림"])
+    has_exception = any(k in (n + " " + t) for k in ["exception", "에러", "오류", "sqlexception", "ioexception"])
+    eps = _extract_endpoints(merged_text)
+
+    # 1) 가장 특정한 것부터
+    if has_health:
+        return "헬스체크 엔드포인트의 가용성과 응답 정합성을 확인합니다."
+    if has_alarm:
+        return "알림(Alarm) 요청/호출을 수행하며 대상/시각/시퀀스 파라미터를 처리합니다."
+    if has_https:
+        return "지정된 URL과 HTTPS 연결을 열고 요청/응답을 처리합니다."
+    if has_stream:
+        return "입력 스트림에서 바이트를 읽어 메모리 버퍼에 기록/변환합니다."
+    if "jsonconvert" in n or (has_json and ("convert" in n or "serialize" in t or "직렬" in t)):
+        return "객체/데이터를 JSON으로 직렬화하여 응답하거나 역직렬화합니다."
+    if has_file and has_write and has_encoding:
+        return "문자열과 파일명을 받아 지정 인코딩으로 파일을 생성/작성합니다."
+    if has_file and has_write:
+        return "파일이 없으면 생성하고, 내용을 기록하여 저장합니다."
+    if has_file and has_read:
+        return "존재하는 파일을 열어 내용을 읽어 반환합니다."
+    if has_email:
+        return "문자열이 유효한 이메일 형식인지 검증합니다."
+    if has_sum and has_json and eps:
+        return "REST API로 두 수의 합을 계산해 JSON 형태로 반환합니다."
+    if has_sum:
+        return "두 수의 합을 계산해 결과를 반환합니다."
+    if has_sub:
+        return "두 수의 차를 계산해 결과를 반환합니다."
+    if "iseven" in n or "짝수" in t:
+        return "입력이 짝수인지 여부를 판별합니다."
+    if has_exception:
+        return "예외 발생 시 자원해제·로깅·오류 응답 등 예외 처리를 수행합니다."
+    if eps:
+        return f"{', '.join(eps)} 엔드포인트의 요청/응답 동작을 검증합니다."
+    # 2) 기본값 (일반화)
+    return f"‘{name}’ 기능의 핵심 동작을 검증합니다."
+
 # [FIX] 실제로 화면에 넣을 동적 설명 마크다운 생성
-#      (요청 반영) 출력 구성: 기능설명, 우선순위 분포, 요약  ― 그리고 헤더는 "Feature (총 N건)" 형태
+#      (출력: 기능설명, 우선순위 분포, 요약 / 헤더: Feature (총 N건))
 def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
     if not groups:
         return "_설명을 생성할 데이터가 없습니다._"
@@ -703,31 +557,30 @@ def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
     parts = []
     for feature_name, df in groups.items():
         df_norm = _ensure_priorities(df)
+        total = len(df_norm)
 
-        # 기능 설명: 휴리스틱 + 첫 행 보조
-        first_desc = str(df_norm.iloc[0]["기능 설명"]) if len(df_norm) else ""
-        func_desc = _feature_korean_desc(feature_name, fallback_from_rows=first_desc)
+        # 그룹 전체 텍스트 수집
+        merged_text = " ".join(
+            df_norm[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()
+        )
+
+        # [FIX] 이름+내용 기반 설명 (첫 행 복사 금지)
+        func_desc = _feature_desc_from_name_and_content(feature_name, merged_text)
 
         # 우선순위 분포
         pr = _priority_counts(df_norm)
 
-        # 시나리오 성향(정상/예외/경계 비율)로 요약 문구 가변화
+        # 버킷 기반 요약
         buckets = Counter()
         for _, row in df_norm.iterrows():
             s = " ".join([str(row.get(c,"")) for c in ["기능 설명","입력값","예상 결과"]])
             buckets[_classify_scenario_bucket(s)] += 1
+        endpoints = _extract_endpoints(merged_text)
 
-        endpoints = _extract_endpoints(" ".join(df_norm[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()))
-        total = len(df_norm)
-
-        # [FIX] 헤더 포맷 변경: "Div (총 3건)" 형태 (tc 범위 제거)
         parts.append(f"#### {feature_name} (총 {total}건)")
         parts.append(f"- **기능 설명**: {func_desc}")
         parts.append(f"- **우선순위 분포**: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
 
-        # [FIX] 우선순위 정리 섹션 삭제 (요청 반영)
-
-        # [FIX] 요약(기능별 상황에 따라 다르게)
         summary_bits = []
         if buckets.get("예외", 0) > 0:
             summary_bits.append("예외 처리로 안정성 검증을 강화")
@@ -737,9 +590,8 @@ def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
             summary_bits.append("관련 엔드포인트 동작 일관성 확인")
         if not summary_bits:
             summary_bits.append("정상·경계 상황을 균형 있게 검증")
-
         parts.append(f"- **요약**: {', '.join(summary_bits)}.")
-        parts.append("")  # spacing
+        parts.append("")
 
     return "\n".join(parts).strip()
 
@@ -749,7 +601,6 @@ def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
 with code_tab:
     st.subheader("🧪 소스코드 기반 테스트케이스 자동 생성기")
 
-    # (유지) 샘플 코드 ZIP만 제공
     st.download_button(
         "⬇️ 샘플 코드 ZIP 다운로드",
         data=build_sample_code_zip(),
@@ -764,13 +615,11 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # Auto-Preview(요약) & Sample TC (기존 유지) + [ADD] 기능힌트 생성
     code_bytes = None
     stats = {"total_files":0,"lang_counts":Counter(),"top_functions":[]}
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
         stats = analyze_code_zip(code_bytes)
-        # [ADD] 기능 힌트 저장 (후처리 강제 분리용)
         st.session_state.feature_hints = build_feature_hints(stats)
 
         with st.expander("📊 Auto-Preview(요약)", expanded=True):
@@ -788,7 +637,6 @@ with code_tab:
             sample_df = build_function_based_sample_tc(stats.get("top_functions", []))
             st.dataframe(sample_df, use_container_width=True)
 
-    # LLM 호출
     if uploaded_file and need_llm_call(uploaded_file, model, qa_role):
         st.session_state["is_loading"] = True
         with st.spinner("🔍 LLM 호출 중입니다. 잠시만 기다려 주세요..."):
@@ -811,7 +659,6 @@ with code_tab:
                             except:
                                 continue
 
-                # [FIX] 프롬프트 보강 (표만 생성하도록 유도)
                 feature_hints = st.session_state.get("feature_hints") or {}
                 hint_blocks = []
                 for key, toks in feature_hints.items():
@@ -851,7 +698,6 @@ with code_tab:
                 result = response.json()["choices"][0]["message"]["content"]
                 st.session_state.llm_result = result
 
-                # [FIX] 결과는 'LLM 원문(정규화)'만 표시: 힌트 기반 강제 분리/정규화 포함
                 try:
                     normalized_md, groups = rebuild_normalized_markdown(result, st.session_state.get("feature_hints"))
                     st.session_state.normalized_markdown = normalized_md
@@ -867,12 +713,9 @@ with code_tab:
                 st.session_state.last_role = qa_role
                 st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: 헤더 문구 + 동적 설명 섹션(요청 반영: 기능설명/우선순위 분포/요약만)
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
-        # (요청1) 문구 변경
         st.markdown("## 📋 생성된 테스트케이스")
-        # (요청2) 작은 글씨, 검정색 캡션 추가
         st.markdown(
             '<small style="color:#000">'
             '아래는 제공된 소스코드를 분석한 후, 기능 단위의 테스트 시나리오를 기반으로 작성한 테스트 케이스입니다. '
@@ -880,10 +723,8 @@ with code_tab:
             '</small>',
             unsafe_allow_html=True
         )
-        # 정규화된 원문(테이블들) 출력
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
-        # [FIX] 설명: 기능설명/우선순위 분포/요약만 출력, 헤더는 "Feature (총 N건)"
         st.markdown("---")
         st.markdown("### 설명")
         try:
@@ -897,14 +738,13 @@ with code_tab:
             st.caption("설명 생성 중 경고: 동적 요약에 실패하여 기본 안내만 표시합니다.")
             st.markdown("_기능별 테이블을 기준으로 우선순위 분포와 요약을 제공합니다._")
 
-    # [FIX] (요청4) 무슨 일이 있어도 '엑셀 다운로드' 버튼은 항상 표시
+    # (항상 노출) 엑셀 다운로드
     excel_bytes = None
     try:
         bio = io.BytesIO()
         if st.session_state.get("parsed_groups"):
             with pd.ExcelWriter(bio, engine="openpyxl") as writer:
                 for key, df in st.session_state.parsed_groups.items():
-                    # 저장 전 우선순위 정규화로 일관성 개선
                     df_out = _ensure_priorities(df)
                     sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key)[:31] or "General"
                     df_out.to_excel(writer, index=False, sheet_name=sheet)
