@@ -7,8 +7,9 @@ import requests
 import re
 # [ADD] 유틸/미리보기/엑셀용
 import io
-from collections import Counter
+from collections import Counter, defaultdict
 from hashlib import sha1
+from pathlib import Path
 
 # ✅ OpenRouter API Key (보안을 위해 secrets.toml 또는 환경변수 사용 권장)
 API_KEY = st.secrets.get("OPENROUTER_API_KEY") or os.environ.get(
@@ -27,12 +28,14 @@ for key in ["scenario_result", "spec_result", "llm_result", "parsed_df", "last_u
     if key not in st.session_state:
         st.session_state[key] = None
 
-# [ADD] 기능별 그룹 보관 + 정규화 원문 보관
+# [ADD] 기능별 그룹 보관 + 정규화 원문 보관 + 기능힌트 보관
 if "parsed_groups" not in st.session_state:
     st.session_state["parsed_groups"] = None
-# [ADD] 정규화된 ‘LLM 원문(표시용 마크다운)’ 저장
 if "normalized_markdown" not in st.session_state:
     st.session_state["normalized_markdown"] = None
+# [ADD] 업로드 코드에서 추출한 기능 힌트 저장 (후처리 분리에 활용)
+if "feature_hints" not in st.session_state:
+    st.session_state["feature_hints"] = None
 
 if st.session_state["is_loading"] is None:
     st.session_state["is_loading"] = False
@@ -148,8 +151,17 @@ def build_sample_tc_excel() -> bytes:
     return bio.getvalue()
 
 # ────────────────────────────────────────────────
-# [ADD] 코드 ZIP 분석/프리뷰 유틸 (기존 유지)
+# [ADD] 코드 ZIP 분석/프리뷰 유틸 (기존 로직 확장: 클래스/파일/디렉터리 → 기능힌트 추출)
 # ────────────────────────────────────────────────
+def _norm_key(s: str) -> str:
+    s = re.sub(r"[^\w\-]+", " ", s)
+    s = re.sub(r"[_\s]+", "-", s).strip("-").lower()
+    return s or "general"
+
+def _display_from_key(key: str) -> str:
+    parts = [p for p in key.split("-") if p]
+    return "".join(w.capitalize() for w in parts) or "General"
+
 def analyze_code_zip(zip_bytes: bytes) -> dict:
     lang_map = {
         ".py": "Python", ".java": "Java", ".js": "JS", ".ts": "TS",
@@ -157,41 +169,72 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
     }
     lang_counts = Counter()
     top_functions = []
+    classes = []
     total_files = 0
     module_counts = Counter()
     sample_paths = []
+    feature_keys = set()  # [ADD] 기능 후보 키
+
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
             names = zf.namelist()
             total_files = len(names)
             sample_paths = names[:10]
             for n in names:
+                if n.endswith("/"):
+                    # 상위 디렉터리명을 기능 후보로
+                    first = n.strip("/").split("/")[0]
+                    if first:
+                        feature_keys.add(_norm_key(first))
+                    continue
                 parts = n.split("/")
                 module = parts[0] if len(parts) > 1 else "(root)"
-                if not n.endswith("/"):
-                    module_counts[module] += 1
+                module_counts[module] += 1
                 ext = os.path.splitext(n)[1].lower()
+                stem = os.path.splitext(os.path.basename(n))[0]
+                if stem:
+                    feature_keys.add(_norm_key(stem))  # 파일명도 후보
                 if ext in lang_map:
                     lang_counts[lang_map[ext]] += 1
                     try:
                         with zf.open(n) as fh:
-                            content = fh.read(20480).decode("utf-8", errors="ignore")
+                            content = fh.read(100_000).decode("utf-8", errors="ignore")
+                            # 함수/메서드
                             for pat in [
                                 r"def\s+([a-zA-Z_]\w*)\s*\(",
                                 r"function\s+([a-zA-Z_]\w*)\s*\(",
                                 r"(?:public|private|protected)?\s*(?:static\s+)?[A-Za-z_<>\[\]]+\s+([a-zA-Z_]\w*)\s*\("
                             ]:
                                 top_functions += re.findall(pat, content)
+                            # 클래스
+                            for cpat in [
+                                r"class\s+([A-Z][A-Za-z0-9_]*)",
+                                r"(?:public|final|abstract)\s+class\s+([A-Z][A-Za-z0-9_]*)"
+                            ]:
+                                classes += re.findall(cpat, content)
                     except Exception:
                         pass
+        # 클래스/함수명도 기능 후보
+        for name in classes[:80]:
+            feature_keys.add(_norm_key(name))
+        for fn in top_functions[:120]:
+            feature_keys.add(_norm_key(fn))
     except zipfile.BadZipFile:
         pass
+
+    # 너무 일반적인 키 제거
+    generic = {"app","main","index","core","utils","common","service","controller","model","routes","handler","api","src","test","tests"}
+    feature_keys = {k for k in feature_keys if k and k not in generic}
+
     return {
         "total_files": total_files,
         "lang_counts": lang_counts,
-        "top_functions": top_functions[:50],
+        "top_functions": top_functions[:200],
         "module_counts": module_counts,
-        "sample_paths": sample_paths
+        "sample_paths": sample_paths,
+        # [ADD]
+        "classes": classes[:200],
+        "feature_keys": sorted(feature_keys)[:40],  # 프롬프트 부담 완화
     }
 
 
@@ -203,36 +246,28 @@ def estimate_tc_count(stats: dict) -> int:
     return max(3, min(estimate, 300))
 
 # ────────────────────────────────────────────────
-# [ADD] LLM 결과 포맷(핵심): 기능별 테이블 분리 + 그룹별 TC ID 재넘버링 + 엑셀 시트 분리
+# [ADD] LLM 결과 파싱/정규화 유틸 확장 (기능 힌트 기반 강제 분리)
 # ────────────────────────────────────────────────
-
-# [ADD] 코드펜스 제거(테이블 파싱 방해 방지)
 def _strip_code_fences(md: str) -> str:
     return re.sub(r"```.*?```", "", md, flags=re.DOTALL)
 
-# [ADD] 마크다운 테이블 + 직전 헤딩 매핑 추출 (헤딩-테이블 사이 0~3줄의 텍스트 허용)  ← 파싱 강건화
 def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]]:
     text = _strip_code_fences(md_text)
     lines = text.splitlines()
     tables = []
     i = 0
-    # [FIX] 헤딩 위치를 기억해두고, 그 다음 0~3줄 내 등장하는 첫 테이블을 해당 헤딩에 매핑
     last_heading = None
     heading_line = -999
     while i < len(lines):
         line = lines[i].rstrip()
-        # 헤딩 탐지
         m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
         if m:
             last_heading = m.group(1).strip()
             heading_line = i
             i += 1
             continue
-        # 테이블 헤더 + 구분선
         if "|" in line and i + 1 < len(lines) and re.search(r"\|\s*:?-{2,}\s*\|", lines[i + 1]):
-            # 직전 헤딩과의 거리 제한(0~3줄 사이에 테이블이 오도록 허용)
             feature_name = last_heading if 0 <= (i - heading_line - 1) <= 3 else ""
-            # 테이블 바디 수집
             j = i + 2
             rows = [line, lines[i + 1]]
             while j < len(lines):
@@ -286,7 +321,6 @@ def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
             df2[c] = ""
     return df2[["TC ID","기능 설명","입력값","예상 결과","우선순위"]]
 
-# [ADD] 기능 키 정규화(시트명/ID용)
 def _normalize_feature_key(name: str, sample_row: dict | None = None) -> tuple[str,str]:
     key = (name or "").strip()
     if not key and sample_row:
@@ -304,29 +338,57 @@ def _normalize_feature_key(name: str, sample_row: dict | None = None) -> tuple[s
     key_id = re.sub(r"[^A-Za-z0-9 ]", "", sheet).strip().lower().replace(" ", "-") or "general"
     return sheet, key_id
 
-# [ADD] TCID 접두 추출 (예: TC-AlarmMgr-001 → 'alarmmgr')
 def _extract_prefix_from_tcid(tcid: str) -> str | None:
     m = re.match(r"(?i)^TC[-_]?([A-Za-z][A-Za-z0-9]+)-\d{2,4}$", str(tcid).strip())
     if m:
         return m.group(1).lower()
     return None
 
-# [ADD] 기능 키 추정(단일 DF 강제 분리용): TCID 접두→기능설명 키워드→Fallback
-def _infer_key_from_row(row: pd.Series) -> str:
-    tcid = str(row.get("TC ID",""))
-    feat = str(row.get("기능 설명",""))
-    pref = _extract_prefix_from_tcid(tcid)
+# [ADD] 기능 힌트(aliases) 생성: 각 key에 대해 파일명/클래스/함수 파생 토큰 포함
+def build_feature_hints(stats: dict) -> dict:
+    keys = stats.get("feature_keys", []) or []
+    aliases = defaultdict(set)
+    # 원 키
+    for k in keys:
+        aliases[k].add(k)
+        aliases[k].add(k.replace("-", ""))
+    # 파일/클래스/함수에서 파생 토큰
+    for name in (stats.get("classes") or []) + (stats.get("top_functions") or []):
+        norm = _norm_key(name)
+        if not norm: 
+            continue
+        # 가장 유사한 키에 매핑(간단: 접두 일치/부분 일치)
+        target = None
+        for k in keys:
+            if norm.startswith(k) or k.startswith(norm) or norm.replace("-","") in k.replace("-",""):
+                target = k; break
+        if target:
+            aliases[target].update({norm, norm.replace("-", ""), name.lower()})
+    # 디렉터리/파일 기반 키(이미 analyze에서 넣었음)
+    return {k: sorted(v) for k, v in aliases.items()}
+
+# [ADD] 힌트 기반 행→기능 키 추정
+def _infer_key_from_row_with_hints(row: pd.Series, hints: dict) -> str:
+    text = " ".join([str(row.get(c,"")) for c in ["TC ID","기능 설명","입력값","예상 결과"]]).lower()
+    # TCID 접두 우선
+    pref = _extract_prefix_from_tcid(str(row.get("TC ID","")))
     if pref:
         return pref
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9]+", feat)
-    if tokens:
-        return "-".join(tokens[:2]).lower()
-    return "general"
+    # 힌트 토큰 스캔
+    best_key, best_hits = None, 0
+    for key, toks in hints.items():
+        hits = 0
+        for t in toks:
+            t2 = t.lower()
+            if t2 and t2 in text:
+                hits += 1
+        if hits > best_hits:
+            best_key, best_hits = key, hits
+    return best_key or "general"
 
-# [ADD] 단일 DF → 기능별 분리
-def split_single_df(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def split_single_df_feature_aware(df: pd.DataFrame, hints: dict) -> dict[str, pd.DataFrame]:
     df2 = _normalize_headers(df).fillna("")
-    df2["_k_"] = df2.apply(_infer_key_from_row, axis=1)
+    df2["_k_"] = df2.apply(lambda r: _infer_key_from_row_with_hints(r, hints), axis=1)
     groups = {}
     for k, sub in df2.groupby("_k_"):
         sub = sub.drop(columns=["_k_"]).reset_index(drop=True)
@@ -335,7 +397,6 @@ def split_single_df(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         groups[sheet[:31] or "General"] = sub
     return groups
 
-# [ADD] 문서 전체 → 기능별 그룹핑(테이블 경계 보존) + 그룹 내 tc-<key>-NNN 재부여
 def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
     tbls = _parse_md_tables_with_heading(md_text)
     if not tbls:
@@ -359,7 +420,6 @@ def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
         groups[final_name] = df_norm
     return groups
 
-# [ADD] 화면 표시용 결합 표 (엑셀 폴백용 기존 유지)
 def concat_groups_for_view(groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not groups:
         return pd.DataFrame(columns=["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"])
@@ -370,7 +430,6 @@ def concat_groups_for_view(groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
         view_rows.append(df2)
     return pd.concat(view_rows, ignore_index=True)[["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"]]
 
-# [ADD] DF → 마크다운 테이블 재구성 (원문 형식 유지용)
 def _df_to_md_table(df: pd.DataFrame) -> str:
     cols = ["TC ID","기능 설명","입력값","예상 결과","우선순위"]
     use_cols = [c for c in cols if c in df.columns]
@@ -381,51 +440,41 @@ def _df_to_md_table(df: pd.DataFrame) -> str:
         rows.append("| " + " | ".join(str(r[c]) for c in use_cols) + " |")
     return "\n".join([header, sep] + rows)
 
-# [ADD] 핵심: “LLM 원문”을 기능/ID 정규화하여 ‘원문 형태’로 재구성
-def rebuild_normalized_markdown(md_text: str) -> tuple[str, dict[str, pd.DataFrame]]:
-    """
-    - LLM이 출력한 원문(헤딩 + 표)을 파싱
-    - 각 표를 기능별 그룹으로 보고 TC ID를 tc-<key>-NNN으로 재부여
-    - 동일한 레이아웃(헤딩 + 마크다운 테이블)으로 재출력
-    - 반환: (정규화된 원문 마크다운, 그룹 딕셔너리)
-    """
+# [FIX] 핵심: 원문을 기능별 + ID정규화 ‘원문형식’으로 재구성 (힌트 기반 강제 분리 포함)
+def rebuild_normalized_markdown(md_text: str, feature_hints: dict | None) -> tuple[str, dict[str, pd.DataFrame]]:
     groups = group_tables_and_renumber(md_text)
     if not groups:
-        # 표가 1개 형태로만 나온 경우 파싱되었는지 재시도
         tbls = _parse_md_tables_with_heading(md_text)
         if tbls:
-            groups = split_single_df(_normalize_headers(tbls[0][1]))
+            # 단일 테이블이거나 헤딩 매핑 실패 → 힌트 기반 강제 분리
+            base_df = _normalize_headers(tbls[0][1])
+            hints = feature_hints or {}
+            groups = split_single_df_feature_aware(base_df, hints)
         else:
-            return (md_text, {})  # 아예 표 구조가 아니면 원문 그대로
-
-    # 헤딩 순서를 원문대로 유지하기 위해 재스캔
+            return (md_text, {})
+    # 원문 순서 보존
     ordered = []
     tbls2 = _parse_md_tables_with_heading(md_text)
     seen = set()
     for (heading, df) in tbls2:
         sheet_name, key_id = _normalize_feature_key(heading, df.iloc[0].to_dict() if len(df) else None)
-        # 시트명 매칭
         candidates = [k for k in groups.keys() if k.startswith(sheet_name)]
         name = candidates[0] if candidates else sheet_name
         if name in groups and name not in seen:
-            ordered.append(name)
-            seen.add(name)
-    # 누락된 그룹(헤딩 없던 표) 보충
+            ordered.append(name); seen.add(name)
     for name in groups.keys():
         if name not in seen:
             ordered.append(name)
-
     parts = []
     for name in ordered:
         df = groups[name]
         parts.append(f"## {name}")
         parts.append(_df_to_md_table(df))
-        parts.append("")  # 공백줄
-
+        parts.append("")
     return ("\n".join(parts).strip(), groups)
 
 # ────────────────────────────────────────────────
-# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화 + 도메인형 TC ID 넘버링)
+# [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (기존 유지)
 # ────────────────────────────────────────────────
 def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     stop = {
@@ -446,16 +495,9 @@ def make_tc_id_from_fn(fn: str, used_ids: set, seq: int | None = None) -> str:
     return tcid
 
 def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
-    """
-    [FIX] 요구사항 반영:
-      - 1) distinct kind 기반 2~3건
-      - 2) 입력/예상결과 디테일 템플릿
-      - 3) TC ID: TC-<키워드>-### 형식으로 넘버링 부여
-      - ※ LLM 생성 TC ID에는 영향 없음 (본 함수는 Auto-Preview 전용)
-    """
     rows = []
     used_kinds = set()
-    used_ids = set()  # TC ID 중복 방지
+    used_ids = set()
 
     def priority(kind: str) -> str:
         high = {"div", "auth", "write", "delete", "io", "validate"}
@@ -520,22 +562,20 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
         if any(k in s for k in ["upload", "download", "request", "client", "socket"]): return "io"
         return "default"
 
-    # ➊ distinct kind 기준으로 최대 3건 수집 (TC ID에 넘버링 부여)
     candidates = []
-    seq_counter = 1  # [FIX] TC ID 넘버링 시작
+    seq_counter = 1
     for fn in top_functions:
         kind = classify(fn)
         if kind in used_kinds:
             continue
         used_kinds.add(kind)
         title, inp, exp = templates_for_kind(kind, fn)[0]
-        tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] TC-<Base>-### 부여
+        tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)
         seq_counter += 1
         candidates.append([kind, fn, tcid, title, inp, exp, priority(kind)])
         if len(candidates) >= 3:
             break
 
-    # ➋ 결과 구성 (2~3건 보장, 서로 다른 케이스, 넘버링 지속)
     result = []
     if len(candidates) >= 3:
         for c in candidates[:3]:
@@ -548,13 +588,11 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
     elif len(candidates) == 1:
         kind, fn, _, _, _, _, pr = candidates[0]
         t_list = templates_for_kind(kind, fn)
-        # 두 개 템플릿을 서로 다른 ID로 (넘버링 이어서)
         for (title, inp, exp) in t_list[:2]:
-            tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)  # [FIX] 같은 base에 다른 ### 부여
+            tcid = make_tc_id_from_fn(fn, used_ids, seq=seq_counter)
             seq_counter += 1
             result.append([tcid, title, inp, exp, pr])
     else:
-        # 함수가 전혀 없는 경우: 기본 2건 (서로 다른 ID, 넘버링 부여)
         tcid1 = make_tc_id_from_fn("Bootstrap_Init", used_ids, seq=1)
         tcid2 = make_tc_id_from_fn("CorePath_Error", used_ids, seq=2)
         result = [
@@ -590,11 +628,13 @@ with code_tab:
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
-    # Auto-Preview(요약) & Sample TC (기존 유지)
+    # Auto-Preview(요약) & Sample TC (기존 유지) + [ADD] 기능힌트 생성
     code_bytes = None
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
         stats = analyze_code_zip(code_bytes)
+        # [ADD] 기능 힌트 저장 (후처리 강제 분리용)
+        st.session_state.feature_hints = build_feature_hints(stats)
 
         with st.expander("📊 Auto-Preview(요약)", expanded=True):
             lang_str = ", ".join([f"{k} {v}개" for k, v in stats["lang_counts"].most_common()]) if stats["lang_counts"] else "감지된 언어 없음"
@@ -636,19 +676,36 @@ with code_tab:
                                     full_code += f"\n\n# FILE: {file}\n{code}"
                             except:
                                 continue
+
+            # [FIX] 프롬프트 보강: 기능별 섹션 강제 + TCID 규칙 명시 + 힌트 제공
+            feature_hints = st.session_state.get("feature_hints") or {}
+            hint_blocks = []
+            for key, toks in feature_hints.items():
+                disp = _display_from_key(key)
+                toks_view = ", ".join(sorted(set(toks))[:6])
+                hint_blocks.append(f"- {disp} (key=`{key}`) : {toks_view}")
+            hints_md = "\n".join(hint_blocks) if hint_blocks else "- General (key=`general`)"
+
             prompt = f"""
 너는 시니어 QA 엔지니어이며, 현재 '{qa_role}' 역할을 맡고 있다.
-아래에 제공된 소스코드를 분석하여 기능 단위의 테스트 시나리오 기반 테스트케이스를 생성하라.
+아래 소스코드를 분석하여 **기능별 섹션**으로 테스트케이스를 작성하라.
 
-📌 출력 형식은 아래 마크다운 테이블 형태로 작성하되,
-우선순위는 반드시 High / Medium / Low 중 하나로 작성할 것:
+반드시 아래 형식을 지켜라:
+- 각 기능은 "## 기능명" 헤딩으로 시작한다. (예: `## AlarmManager`)
+- 각 기능 섹션마다 **하나의 마크다운 테이블**만 포함한다.
+- 테이블 컬럼: | TC ID | 기능 설명 | 입력값 | 예상 결과 | 우선순위 |
+- **TC ID는 반드시 `tc-<feature-key>-NNN` 형식**을 사용하라. (예: `tc-alarm-001`)
+  - `<feature-key>`는 아래 힌트 목록의 key 중 가장 적합한 값을 사용한다.
+  - 각 기능 섹션마다 NNN은 001부터 다시 시작한다.
+- 기능 섹션 외 불필요한 텍스트/설명은 넣지 말라.
 
-| TC ID | 기능 설명 | 입력값 | 예상 결과 | 우선순위 |
-|-------|-----------|--------|------------|---------|
+[기능 힌트 목록]
+{hints_md}
 
-소스코드:
+[소스코드]
 {full_code}
 """
+
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {API_KEY}"},
@@ -662,30 +719,29 @@ with code_tab:
             result = response.json()["choices"][0]["message"]["content"]
             st.session_state.llm_result = result
 
-            # [FIX] ▼ 결과는 한 화면(‘LLM 원문’)만 표시하되, 내부는 기능분리+ID정규화된 ‘원문형식’으로 재구성 ▼
+            # [FIX] 결과는 'LLM 원문(정규화)'만 표시: 힌트 기반 강제 분리/정규화 포함
             try:
-                normalized_md, groups = rebuild_normalized_markdown(result)  # [ADD] 핵심
+                normalized_md, groups = rebuild_normalized_markdown(result, st.session_state.get("feature_hints"))
                 st.session_state.normalized_markdown = normalized_md
                 st.session_state.parsed_groups = groups if groups else None
                 st.session_state.parsed_df = concat_groups_for_view(groups) if groups else None
             except Exception:
-                st.session_state.normalized_markdown = result  # 파싱 실패 시 원문 그대로
+                st.session_state.normalized_markdown = result
                 st.session_state.parsed_groups = None
                 st.session_state.parsed_df = None
-            # [FIX] ▲ 변경 끝 ▲
 
             st.session_state.last_uploaded_file = uploaded_file.name
             st.session_state.last_model = model
             st.session_state.last_role = qa_role
         st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: 오직 ‘LLM 원문 보기’만, 단 정규화된 원문을 그대로 출력
+    # [FIX] 결과 표시: 오직 ‘LLM 원문 보기’만 (정규화 결과)
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
         st.markdown("## 🧾 LLM 원문 보기 (기능별 분리 + TC ID 정규화 적용)")
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
-    # [FIX] 엑셀 다운로드: 기능별 '시트' 분리(시트명=기능명). 그룹 없으면 단일 시트 폴백.
+    # [FIX] 엑셀 다운로드: 기능별 시트 분리
     if (st.session_state.parsed_groups or st.session_state.parsed_df is not None) and not need_llm_call(
             uploaded_file, model, qa_role):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
