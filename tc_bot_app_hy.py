@@ -742,6 +742,156 @@ def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
         parts.append("")  # spacing
 
     return "\n".join(parts).strip()
+# ────────────────────────────────────────────────
+# [ADD] 동적 설명 생성을 위한 보강 유틸 (원본 보존, 신규 추가만)
+# ────────────────────────────────────────────────
+
+from collections import Counter  # 이미 import 되어 있다면 중복 import 허용됨(Python 정상 동작)
+
+def _normalize_priority_token(v: str) -> str:
+    s = str(v or "").strip().lower()
+    if not s:
+        return ""
+    mapping = {
+        "1": "High", "h": "High", "high": "High", "높음": "High", "상": "High", "필수": "High", "critical": "High", "crit": "High",
+        "2": "Medium", "m": "Medium", "med": "Medium", "medium": "Medium", "중간": "Medium", "보통": "Medium", "중": "Medium",
+        "3": "Low", "l": "Low", "low": "Low", "낮음": "Low", "하": "Low", "optional": "Low", "옵션": "Low"
+    }
+    return mapping.get(s, "High" if "high" in s else ("Medium" if "med" in s else ("Low" if "low" in s else "")))
+
+def _infer_priority_from_text(text: str) -> str:
+    s = (text or "").lower()
+    if any(k in s for k in ["zerodivision", "division by zero", "0으로", "error", "exception", "fatal", "권한", "unauthorized", "forbidden", "not found", "401", "403", "404", "timeout", "타임아웃", "invalid", "오류"]):
+        return "High"
+    if any(k in s for k in ["경계", "boundary", "edge", "최대", "최소", "음수", "소수", "float", "overflow", "underflow"]):
+        return "Medium"
+    return "Medium"
+
+def _ensure_priorities(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    if "우선순위" not in df2.columns:
+        df2["우선순위"] = ""
+    norm_vals = []
+    for _, row in df2.iterrows():
+        raw = str(row.get("우선순위", "")).strip()
+        merged_text = " ".join([str(row.get(c, "")) for c in ["기능 설명", "입력값", "예상 결과"]])
+        norm = _normalize_priority_token(raw)
+        if not norm:
+            norm = _infer_priority_from_text(merged_text)
+        norm_vals.append(norm)
+    df2["우선순위"] = norm_vals
+    return df2
+
+def _priority_counts(df: pd.DataFrame) -> dict:
+    df2 = _ensure_priorities(df)
+    vals = df2["우선순위"].astype(str).str.strip().str.title().tolist()
+    c = Counter(vals)
+    return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
+
+def _extract_endpoints(text: str) -> list[str]:
+    eps = set(re.findall(r"/[A-Za-z0-9_\-./]+", text))
+    cleaned = sorted({e.strip().rstrip(".,)") for e in eps if len(e) <= 64})
+    return cleaned[:5]
+
+def _classify_scenario_bucket(s: str) -> str:
+    s = s.lower()
+    if any(k in s for k in ["오류", "error", "예외", "invalid", "0으로", "zero", "null", "timeout", "권한", "401", "403", "404"]):
+        return "예외"
+    if any(k in s for k in ["경계", "boundary", "최대", "최소", "음수", "소수", "edge", "limit"]):
+        return "경계"
+    return "정상"
+
+def _feature_desc_from_name_and_content(name: str, merged_text: str) -> str:
+    n = (name or "").lower()
+    t = (merged_text or "").lower()
+    has_json = any(k in t for k in ["json", "application/json", "{", "}", "직렬화", "serialize", "deserialize"])
+    has_health = "/health" in t or "health" in n
+    has_sum = any(k in (n + " " + t) for k in ["sum", "add", "덧셈", "합계", "합산"])
+    has_sub = any(k in (n + " " + t) for k in ["sub", "subtract", "차감", "감산"])
+    has_email = any(k in (n + " " + t) for k in ["email", "이메일"])
+    has_file = any(k in (n + " " + t) for k in ["file", "파일"])
+    has_write = any(k in (n + " " + t) for k in ["write", "쓰기", "저장"])
+    has_read = any(k in (n + " " + t) for k in ["read", "읽기", "load"])
+    has_encoding = any(k in t for k in ["euc-kr", "utf-8", "charset"])
+    has_https = any(k in (n + " " + t) for k in ["httpsurlconnection", "https", "ssl", "tls"])
+    has_stream = any(k in (n + " " + t) for k in ["bytearrayoutputstream", "inputstream", "stream"])
+    has_alarm = any(k in (n + " " + t) for k in ["alarm", "알림"])
+    has_exception = any(k in (n + " " + t) for k in ["exception", "에러", "오류", "sqlexception", "ioexception"])
+    eps = _extract_endpoints(merged_text)
+
+    if has_health:
+        return "헬스체크 엔드포인트의 가용성과 응답 정합성을 확인합니다."
+    if has_alarm:
+        return "알림(Alarm) 요청/호출을 수행하며 대상/시각/시퀀스 파라미터를 처리합니다."
+    if has_https:
+        return "지정된 URL과 HTTPS 연결을 열고 요청/응답을 처리합니다."
+    if has_stream:
+        return "입력 스트림에서 바이트를 읽어 메모리 버퍼에 기록/변환합니다."
+    if "jsonconvert" in n or (has_json and ("convert" in n or "serialize" in t or "직렬" in t)):
+        return "객체/데이터를 JSON으로 직렬화하여 응답하거나 역직렬화합니다."
+    if has_file and has_write and has_encoding:
+        return "문자열과 파일명을 받아 지정 인코딩으로 파일을 생성/작성합니다."
+    if has_file and has_write:
+        return "파일이 없으면 생성하고, 내용을 기록하여 저장합니다."
+    if has_file and has_read:
+        return "존재하는 파일을 열어 내용을 읽어 반환합니다."
+    if has_email:
+        return "문자열이 유효한 이메일 형식인지 검증합니다."
+    if has_sum and has_json and eps:
+        return "REST API로 두 수의 합을 계산해 JSON 형태로 반환합니다."
+    if has_sum:
+        return "두 수의 합을 계산해 결과를 반환합니다."
+    if has_sub:
+        return "두 수의 차를 계산해 결과를 반환합니다."
+    if "iseven" in n or "짝수" in t:
+        return "입력이 짝수인지 여부를 판별합니다."
+    if has_exception:
+        return "예외 발생 시 자원해제·로깅·오류 응답 등 예외 처리를 수행합니다."
+    if eps:
+        return f"{', '.join(eps)} 엔드포인트의 요청/응답 동작을 검증합니다."
+    return f"‘{name}’ 기능의 핵심 동작을 검증합니다."
+
+def build_dynamic_explanations_v2(groups: dict[str, pd.DataFrame]) -> str:
+    """
+    [ADD] 설명 섹션 전용. 요구된 3요소만 출력:
+      - 기능 설명 (소스/테이블 기반 동적)
+      - 우선순위 분포 (High/Medium/Low 카운트)
+      - 요약 (예외/경계/엔드포인트 존재 기반)
+    또한 헤더 표기는 "Feature (총 N건)" 형식으로 통일.
+    """
+    if not groups:
+        return "_설명을 생성할 데이터가 없습니다._"
+
+    parts = []
+    for feature_name, df in groups.items():
+        df_norm = _ensure_priorities(df)
+        total = len(df_norm)
+
+        merged_text = " ".join(
+            df_norm[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()
+        )
+
+        func_desc = _feature_desc_from_name_and_content(feature_name, merged_text)
+        pr = _priority_counts(df_norm)
+
+        buckets = Counter()
+        for _, row in df_norm.iterrows():
+            s = " ".join([str(row.get(c,"")) for c in ["기능 설명","입력값","예상 결과"]])
+            buckets[_classify_scenario_bucket(s)] += 1
+        endpoints = _extract_endpoints(merged_text)
+
+        parts.append(f"#### {feature_name} (총 {total}건)")
+        parts.append(f"- **기능 설명**: {func_desc}")
+        parts.append(f"- **우선순위 분포**: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
+        summary_bits = []
+        if buckets.get("예외", 0) > 0: summary_bits.append("예외 처리로 안정성 검증을 강화")
+        if buckets.get("경계", 0) > 0: summary_bits.append("경계 입력을 포함해 견고성 확인")
+        if endpoints:                summary_bits.append("관련 엔드포인트 동작 일관성 확인")
+        if not summary_bits:         summary_bits.append("정상·경계 상황을 균형 있게 검증")
+        parts.append(f"- **요약**: {', '.join(summary_bits)}.")
+        parts.append("")
+    return "\n".join(parts).strip()
+
 
 # ────────────────────────────────────────────────
 # 🧪 TAB 1: 소스코드 → 테스트케이스 자동 생성기
