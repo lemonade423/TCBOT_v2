@@ -7,7 +7,7 @@ import requests
 import re
 # [ADD] 유틸/미리보기/엑셀용
 import io
-from collections import Counter, defaultdict
+from collections import Counter
 from hashlib import sha1
 
 # ✅ OpenRouter API Key (보안을 위해 secrets.toml 또는 환경변수 사용 권장)
@@ -27,9 +27,12 @@ for key in ["scenario_result", "spec_result", "llm_result", "parsed_df", "last_u
     if key not in st.session_state:
         st.session_state[key] = None
 
-# [ADD] 기능별 그룹 보관용 세션 키 (엑셀 시트 분리용)
+# [ADD] 기능별 그룹 보관 + 정규화 원문 보관
 if "parsed_groups" not in st.session_state:
     st.session_state["parsed_groups"] = None
+# [ADD] 정규화된 ‘LLM 원문(표시용 마크다운)’ 저장
+if "normalized_markdown" not in st.session_state:
+    st.session_state["normalized_markdown"] = None
 
 if st.session_state["is_loading"] is None:
     st.session_state["is_loading"] = False
@@ -207,32 +210,31 @@ def estimate_tc_count(stats: dict) -> int:
 def _strip_code_fences(md: str) -> str:
     return re.sub(r"```.*?```", "", md, flags=re.DOTALL)
 
-# [ADD] 마크다운 테이블 + 직전 헤딩 매핑 추출
+# [ADD] 마크다운 테이블 + 직전 헤딩 매핑 추출 (헤딩-테이블 사이 0~3줄의 텍스트 허용)  ← 파싱 강건화
 def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]]:
     text = _strip_code_fences(md_text)
     lines = text.splitlines()
     tables = []
     i = 0
-    while i < len(lines) - 1:
-        header = lines[i].strip()
-        sep = lines[i + 1].strip() if i + 1 < len(lines) else ""
-        if "|" in header and re.search(r"\|\s*:?-{2,}\s*\|", sep):
-            feature_name = ""
-            for back in range(1, 6):
-                if i - back < 0:
-                    break
-                prev = lines[i - back].strip()
-                m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", prev)
-                if m:
-                    feature_name = m.group(1); break
-                m2 = re.match(r"^\s{0,3}\*\*(.+?)\*\*\s*$", prev)
-                if m2:
-                    feature_name = m2.group(1); break
-                m3 = re.match(r"^\s*(기능|Feature)\s*[:：]\s*(.+?)\s*$", prev, flags=re.IGNORECASE)
-                if m3:
-                    feature_name = m3.group(2); break
+    # [FIX] 헤딩 위치를 기억해두고, 그 다음 0~3줄 내 등장하는 첫 테이블을 해당 헤딩에 매핑
+    last_heading = None
+    heading_line = -999
+    while i < len(lines):
+        line = lines[i].rstrip()
+        # 헤딩 탐지
+        m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if m:
+            last_heading = m.group(1).strip()
+            heading_line = i
+            i += 1
+            continue
+        # 테이블 헤더 + 구분선
+        if "|" in line and i + 1 < len(lines) and re.search(r"\|\s*:?-{2,}\s*\|", lines[i + 1]):
+            # 직전 헤딩과의 거리 제한(0~3줄 사이에 테이블이 오도록 허용)
+            feature_name = last_heading if 0 <= (i - heading_line - 1) <= 3 else ""
+            # 테이블 바디 수집
             j = i + 2
-            rows = [header, sep]
+            rows = [line, lines[i + 1]]
             while j < len(lines):
                 cur = lines[j]
                 if cur.strip() == "" or ("|" not in cur):
@@ -243,8 +245,8 @@ def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]
             if df is not None and len(df.columns) >= 3:
                 tables.append((feature_name, df))
             i = j
-        else:
-            i += 1
+            continue
+        i += 1
     return tables
 
 def _md_table_to_df(table_str: str) -> pd.DataFrame | None:
@@ -333,7 +335,7 @@ def split_single_df(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         groups[sheet[:31] or "General"] = sub
     return groups
 
-# [ADD] 핵심: 문서 전체 → 기능별 그룹핑(테이블 경계 보존) + 그룹 내 tc-<key>-NNN 재부여
+# [ADD] 문서 전체 → 기능별 그룹핑(테이블 경계 보존) + 그룹 내 tc-<key>-NNN 재부여
 def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
     tbls = _parse_md_tables_with_heading(md_text)
     if not tbls:
@@ -357,7 +359,7 @@ def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
         groups[final_name] = df_norm
     return groups
 
-# [ADD] 화면 표시용(결합 표): 보기 편하도록 기능컬럼 추가해 합쳐서 보여줌
+# [ADD] 화면 표시용 결합 표 (엑셀 폴백용 기존 유지)
 def concat_groups_for_view(groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not groups:
         return pd.DataFrame(columns=["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"])
@@ -367,6 +369,60 @@ def concat_groups_for_view(groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
         df2["기능"] = sheet
         view_rows.append(df2)
     return pd.concat(view_rows, ignore_index=True)[["기능","TC ID","기능 설명","입력값","예상 결과","우선순위"]]
+
+# [ADD] DF → 마크다운 테이블 재구성 (원문 형식 유지용)
+def _df_to_md_table(df: pd.DataFrame) -> str:
+    cols = ["TC ID","기능 설명","입력값","예상 결과","우선순위"]
+    use_cols = [c for c in cols if c in df.columns]
+    header = "| " + " | ".join(use_cols) + " |"
+    sep = "| " + " | ".join(["---"] * len(use_cols)) + " |"
+    rows = []
+    for _, r in df[use_cols].iterrows():
+        rows.append("| " + " | ".join(str(r[c]) for c in use_cols) + " |")
+    return "\n".join([header, sep] + rows)
+
+# [ADD] 핵심: “LLM 원문”을 기능/ID 정규화하여 ‘원문 형태’로 재구성
+def rebuild_normalized_markdown(md_text: str) -> tuple[str, dict[str, pd.DataFrame]]:
+    """
+    - LLM이 출력한 원문(헤딩 + 표)을 파싱
+    - 각 표를 기능별 그룹으로 보고 TC ID를 tc-<key>-NNN으로 재부여
+    - 동일한 레이아웃(헤딩 + 마크다운 테이블)으로 재출력
+    - 반환: (정규화된 원문 마크다운, 그룹 딕셔너리)
+    """
+    groups = group_tables_and_renumber(md_text)
+    if not groups:
+        # 표가 1개 형태로만 나온 경우 파싱되었는지 재시도
+        tbls = _parse_md_tables_with_heading(md_text)
+        if tbls:
+            groups = split_single_df(_normalize_headers(tbls[0][1]))
+        else:
+            return (md_text, {})  # 아예 표 구조가 아니면 원문 그대로
+
+    # 헤딩 순서를 원문대로 유지하기 위해 재스캔
+    ordered = []
+    tbls2 = _parse_md_tables_with_heading(md_text)
+    seen = set()
+    for (heading, df) in tbls2:
+        sheet_name, key_id = _normalize_feature_key(heading, df.iloc[0].to_dict() if len(df) else None)
+        # 시트명 매칭
+        candidates = [k for k in groups.keys() if k.startswith(sheet_name)]
+        name = candidates[0] if candidates else sheet_name
+        if name in groups and name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    # 누락된 그룹(헤딩 없던 표) 보충
+    for name in groups.keys():
+        if name not in seen:
+            ordered.append(name)
+
+    parts = []
+    for name in ordered:
+        df = groups[name]
+        parts.append(f"## {name}")
+        parts.append(_df_to_md_table(df))
+        parts.append("")  # 공백줄
+
+    return ("\n".join(parts).strip(), groups)
 
 # ────────────────────────────────────────────────
 # [FIX] NEW: "함수명 분석 기반" 샘플 TC 생성기 (중복 방지 + 2~3건 가변 + 디테일 강화 + 도메인형 TC ID 넘버링)
@@ -606,20 +662,14 @@ with code_tab:
             result = response.json()["choices"][0]["message"]["content"]
             st.session_state.llm_result = result
 
-            # [FIX] ▼ 기능 분리 파이프라인: 결과를 “하나의 최종 결과”로 표준화 (표시도 이 결과만) ▼
+            # [FIX] ▼ 결과는 한 화면(‘LLM 원문’)만 표시하되, 내부는 기능분리+ID정규화된 ‘원문형식’으로 재구성 ▼
             try:
-                tbl_with_heading = _parse_md_tables_with_heading(result)
-                groups = {}
-                if tbl_with_heading:
-                    # 표가 여러 개인 경우: 각 표를 기능 단위로 보존(헤딩 유무와 무관)
-                    groups = group_tables_and_renumber(result)
-                    # 단일 표 등으로 실패 시 보조 분리
-                    if not groups and len(tbl_with_heading) == 1:
-                        groups = split_single_df(tbl_with_heading[0][1])
-                # 파싱이 아예 안 될 경우 groups는 비어둘 수 있음
+                normalized_md, groups = rebuild_normalized_markdown(result)  # [ADD] 핵심
+                st.session_state.normalized_markdown = normalized_md
                 st.session_state.parsed_groups = groups if groups else None
                 st.session_state.parsed_df = concat_groups_for_view(groups) if groups else None
             except Exception:
+                st.session_state.normalized_markdown = result  # 파싱 실패 시 원문 그대로
                 st.session_state.parsed_groups = None
                 st.session_state.parsed_df = None
             # [FIX] ▲ 변경 끝 ▲
@@ -629,20 +679,11 @@ with code_tab:
             st.session_state.last_role = qa_role
         st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: “LLM 원문” 대신, 후처리된 최종 결과만 노출 (요구사항2)
-    if st.session_state.parsed_groups:
+    # [FIX] 결과 표시: 오직 ‘LLM 원문 보기’만, 단 정규화된 원문을 그대로 출력
+    if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
-        st.markdown("## 📋 생성된 테스트케이스 (기능별 분리 + ID 정규화 반영)")
-        for key, df in st.session_state.parsed_groups.items():
-            st.markdown(f"#### 기능: `{key}`")
-            st.dataframe(df, use_container_width=True)
-        # [ADD] 원문은 참고용으로만 접기
-        with st.expander("🧾 (옵션) LLM 원문 보기"):
-            st.markdown(st.session_state.llm_result)
-    elif st.session_state.llm_result:
-        # 파싱 실패 시 원문만 표시(기존 폴백)
-        st.warning("⚠️ 후처리 분리에 실패하여 원문을 표시합니다. (표 형식을 확인하세요)")
-        st.markdown(st.session_state.llm_result)
+        st.markdown("## 🧾 LLM 원문 보기 (기능별 분리 + TC ID 정규화 적용)")
+        st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
     # [FIX] 엑셀 다운로드: 기능별 '시트' 분리(시트명=기능명). 그룹 없으면 단일 시트 폴백.
     if (st.session_state.parsed_groups or st.session_state.parsed_df is not None) and not need_llm_call(
