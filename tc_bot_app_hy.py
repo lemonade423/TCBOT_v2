@@ -666,80 +666,20 @@ def _priority_counts(df: pd.DataFrame) -> dict:
     c = Counter(vals)
     return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
 
-# [REQ2][ADD] 한국어 조사 처리 및 "OO는 OO합니다" 문장 보장 유틸
-def _has_jongsung(kor_char: str) -> bool:
-    """한글 음절 종성(받침) 유무 판별."""
-    code = ord(kor_char)
-    if 0xAC00 <= code <= 0xD7A3:
-        return ((code - 0xAC00) % 28) != 0
-    return False
-
-def _topic_particle(noun: str) -> str:
-    """명사 뒤에 적절한 주제 조사(은/는) 결정."""
-    if not noun:
-        return "는"
-    ch = noun[-1]
-    return "은" if _has_jongsung(ch) else "는"
-
-# [BUGFIX-3] 종결부 중복/비문 방지: '합니다' 중복 제거, 불필요한 마침표/어미 정리
-def _clean_predicate_for_hamnida(text: str) -> str:
-    """
-    - 끝의 마침표/공백 제거 → '합니다' 강제 부착
-    - 이미 '합니다'/'합니다.'로 끝나면 중복 부착하지 않음
-    - '한다', '한다.' 등은 '합니다'로 치환
-    """
-    s = (text or "").strip()
-    # '합니다'로 이미 끝나면 그대로 유지
-    if re.search(r"(합니다|합니다\.)\s*$", s):
-        s = re.sub(r"\.\s*$", "", s)  # '합니다.' -> '합니다'
-        return s + "."
-    # 문장 말미 정리
-    s = re.sub(r"(한다|한다\.)\s*$", "합니다", s)
-    s = re.sub(r"(해요|한다고 함)\s*$", "합니다", s)
-    s = re.sub(r"[\.!\s]+$", "", s)
-    # '합니다'가 두 번 연속 나오는 케이스 예방
-    s = re.sub(r"(합니다)+$", "합니다", s)
-    return s + "."
-
-# [REQ2][ADD] 최종 문장 생성 (주제+서술)
-def _ensure_oo_sentence(subject: str, predicate: str) -> str:
-    sj = subject.strip() or "해당 기능"
-    pd = _clean_predicate_for_hamnida(predicate.strip())
-    return f"{sj}{_topic_particle(sj)} {pd}"
-
-# [BUGFIX-1] 행동 키워드(동사/개념) 추출 및 대표 행동 결정
-def _extract_action_signature(text: str) -> tuple[str, str]:
-    """
-    인풋 텍스트에서 자주 등장하는 행동을 규칙 기반으로 매핑.
-    반환: (대표_키, 대표_설명_프레이즈)
-    """
-    s = (text or "").lower()
-    actions = [
-        (r"\b(add|sum|plus|더하|합산)\b",        ("add", "값을 더해 결과를 반환합니다")),
-        (r"\b(div|divide|quotient|나누)\b",      ("div", "두 수를 나누어 결과를 반환합니다")),
-        (r"\b(zerodivision|divide by 0|0\s*으로)\b", ("div0", "두 수를 나누되 0으로 나누는 경우 예외를 발생시킵니다")),
-        (r"\b(auth|login|signin|token|verify|인증|인가)\b", ("auth", "인증·인가 절차를 검증하고 접근 권한을 제어합니다")),
-        (r"\b(validate|검증|유효성)\b",          ("validate", "입력 값을 검증하여 규칙 위반을 식별합니다")),
-        (r"\b(read|get|fetch|load|조회)\b",       ("read", "식별자로 데이터를 조회하여 반환합니다")),
-        (r"\b(create|insert|save|post|put|update|생성|저장|수정|갱신)\b", ("write", "입력 데이터를 저장하거나 수정합니다")),
-        (r"\b(delete|remove|삭제)\b",            ("delete", "대상 리소스를 삭제하고 멱등성을 보장합니다")),
-        (r"\b(upload|download|요청|socket|client|업로드|다운로드)\b", ("io", "파일·네트워크 I/O 동작을 수행하고 오류를 처리합니다")),
-        (r"\b(health|status|ping|헬스|상태)\b",   ("health", "상태를 주기적으로 점검합니다")),
-        (r"\b(alarm|notify|alert|경보|알람)\b",   ("alarm", "알람 이벤트를 관리하고 통지합니다")),
-        (r"\b(schedule|cron|주기|스케줄)\b",     ("schedule", "주기적 작업을 예약·실행합니다")),
-        (r"\b(email|메일)\b",                   ("email", "이메일 형식과 전송 흐름을 점검합니다")),
-    ]
-    scores = Counter()
-    phrase_map = {}
-    for pat, (key, phrase) in actions:
-        if re.search(pat, s):
-            count = len(re.findall(pat, s))
-            scores[key] += count
-            phrase_map[key] = phrase
-    if not scores:
-        return ("default", "핵심 동작을 검증하여 일관성과 신뢰성을 보장합니다")
-    best = scores.most_common(1)[0][0]
-    return (best, phrase_map.get(best, "핵심 동작을 검증하여 일관성과 신뢰성을 보장합니다"))
+# [ADD] 기능명 → 한국어 설명 휴리스틱
+def _feature_korean_desc(name: str, fallback_from_rows: str = "") -> str:
+    n = (name or "").lower()
+    if any(k in n for k in ["add", "sum", "plus"]):
+        return "두 개의 수를 더해 결과를 반환합니다."
+    if any(k in n for k in ["div", "divide"]):
+        return "두 수를 나누어 결과를 반환하며, 0으로 나누는 경우 예외가 발생합니다."
+    if any(k in n for k in ["email", "isemail", "validator", "validate"]):
+        return "문자열이 유효한 이메일 형식인지 검사합니다."
+    if "health" in n:
+        return "헬스체크 엔드포인트의 가용성을 확인합니다."
+    # [ADD] 적절한 휴리스틱이 없을 경우, 첫 행의 기능 설명을 짧게 차용
+    fb = fallback_from_rows.strip()
+    return fb if fb else f"‘{name}’ 기능의 핵심 동작을 검증합니다."
 
 def _extract_endpoints(text: str) -> list[str]:
     eps = set(re.findall(r"/[A-Za-z0-9_\-./]+", text))
@@ -754,24 +694,6 @@ def _classify_scenario_bucket(s: str) -> str:
         return "경계"
     return "정상"
 
-# [REQ1][REQ2][FIX] 기능명/힌트 기반 '기능 설명' 생성 (TC 1번 복붙 금지)
-def _generate_function_description(feature_name: str, df: pd.DataFrame) -> str:
-    """
-    [REQ1] 테이블 전체 텍스트에서 행동 키워드를 추출해 대표 행위를 선택하고,
-           엔드포인트가 있으면 설명에 반영.
-    [REQ2] 결과는 'OO는 OO합니다.' 형태(조사/종결 포함)로 반환.
-    """
-    name = (feature_name or "해당 기능").strip()
-    merged = " ".join(df[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist())
-    key, phrase = _extract_action_signature(merged)
-    endpoints = _extract_endpoints(merged)
-    if endpoints:
-        # 대표 엔드포인트 1~2개만 언급
-        ep = ", ".join(endpoints[:2])
-        phrase = f"{phrase[:-5]}하며 {ep} 엔드포인트의 동작을 확인합니다"  # '...합니다' 제거 후 접속
-    return _ensure_oo_sentence(name, phrase)
-
-# ────────────────────────────────────────────────
 # [FIX] 실제로 화면에 넣을 동적 설명 마크다운 생성
 #      (요청 반영) 출력 구성: 기능설명, 우선순위 분포, 요약  ― 그리고 헤더는 "Feature (총 N건)" 형태
 def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
@@ -782,37 +704,41 @@ def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
     for feature_name, df in groups.items():
         df_norm = _ensure_priorities(df)
 
-        # [BUGFIX-1] 기능 설명을 테이블 전체 맥락 기반으로 생성
-        func_desc = _generate_function_description(feature_name, df_norm)
+        # 기능 설명: 휴리스틱 + 첫 행 보조
+        first_desc = str(df_norm.iloc[0]["기능 설명"]) if len(df_norm) else ""
+        func_desc = _feature_korean_desc(feature_name, fallback_from_rows=first_desc)
 
         # 우선순위 분포
         pr = _priority_counts(df_norm)
 
-        # 버킷 집계
+        # 시나리오 성향(정상/예외/경계 비율)로 요약 문구 가변화
         buckets = Counter()
-        texts_for_bucket = []
         for _, row in df_norm.iterrows():
             s = " ".join([str(row.get(c,"")) for c in ["기능 설명","입력값","예상 결과"]])
-            texts_for_bucket.append(s)
             buckets[_classify_scenario_bucket(s)] += 1
 
-        merged = " ".join(texts_for_bucket).lower()
-        endpoints = _extract_endpoints(merged)
+        endpoints = _extract_endpoints(" ".join(df_norm[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()))
         total = len(df_norm)
 
-        # [BUGFIX-2] 요약이 항상 달라지도록 상세 수치/대표행동/엔드포인트 반영
-        act_key, act_phrase = _extract_action_signature(merged)
-        n_norm = buckets.get("정상", 0)
-        n_edge = buckets.get("경계", 0)
-        n_err  = buckets.get("예외", 0)
-        ep_txt = (", 관련 엔드포인트: " + ", ".join(endpoints[:3])) if endpoints else ""
-
-        summary = f"{act_phrase[:-5]}를 중심으로 정상 {n_norm}건, 경계 {n_edge}건, 예외 {n_err}건을 검증합니다{ep_txt}."
-
+        # [FIX] 헤더 포맷 변경: "Div (총 3건)" 형태 (tc 범위 제거)
         parts.append(f"#### {feature_name} (총 {total}건)")
         parts.append(f"- **기능 설명**: {func_desc}")
         parts.append(f"- **우선순위 분포**: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
-        parts.append(f"- **요약**: {summary}")
+
+        # [FIX] 우선순위 정리 섹션 삭제 (요청 반영)
+
+        # [FIX] 요약(기능별 상황에 따라 다르게)
+        summary_bits = []
+        if buckets.get("예외", 0) > 0:
+            summary_bits.append("예외 처리로 안정성 검증을 강화")
+        if buckets.get("경계", 0) > 0:
+            summary_bits.append("경계 입력을 포함해 견고성 확인")
+        if endpoints:
+            summary_bits.append("관련 엔드포인트 동작 일관성 확인")
+        if not summary_bits:
+            summary_bits.append("정상·경계 상황을 균형 있게 검증")
+
+        parts.append(f"- **요약**: {', '.join(summary_bits)}.")
         parts.append("")  # spacing
 
     return "\n".join(parts).strip()
@@ -957,7 +883,7 @@ with code_tab:
         # 정규화된 원문(테이블들) 출력
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
-        # 설명 섹션
+        # [FIX] 설명: 기능설명/우선순위 분포/요약만 출력, 헤더는 "Feature (총 N건)"
         st.markdown("---")
         st.markdown("### 설명")
         try:
