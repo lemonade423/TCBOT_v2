@@ -666,8 +666,85 @@ def _priority_counts(df: pd.DataFrame) -> dict:
     c = Counter(vals)
     return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
 
-# [ADD] 기능명 → 한국어 설명 휴리스틱
+# [REQ2][ADD] 한국어 조사 처리 및 "OO는 OO합니다" 문장 보장 유틸
+def _has_jongsung(kor_char: str) -> bool:
+    """한글 음절 종성(받침) 유무 판별."""
+    code = ord(kor_char)
+    if 0xAC00 <= code <= 0xD7A3:
+        return ((code - 0xAC00) % 28) != 0
+    return False
+
+def _topic_particle(noun: str) -> str:
+    """명사 뒤에 적절한 주제 조사(은/는) 결정."""
+    if not noun:
+        return "는"
+    ch = noun[-1]
+    return "은" if _has_jongsung(ch) else "는"
+
+def _ensure_oo_sentence(subject: str, predicate: str) -> str:
+    """
+    [REQ2] 'OO는 OO합니다' 형태의 자연어 문장으로 강제 변환.
+    - subject + (은/는) + predicate(마침표 포함, '합니다'로 종결)
+    """
+    sj = subject.strip()
+    pd = predicate.strip()
+    # 종결어미 통일
+    if not pd.endswith("합니다.") and not pd.endswith("합니다"):
+        # 마침표/어미 정리
+        pd = re.sub(r"(한다|한다\.)$", "합니다", pd)
+        if not pd.endswith("합니다"):
+            pd = pd.rstrip(".") + "합니다"
+        pd = pd + "."
+    return f"{sj}{_topic_particle(sj)} {pd}"
+
+# [REQ1][REQ2][FIX] 기능명/힌트 기반 '기능 설명' 생성 (TC 1번 복붙 금지)
+def _generate_function_description(feature_name: str, df: pd.DataFrame) -> str:
+    """
+    [REQ1] LLM 소스 분석 결과(= 기능 헤딩/키워드)와 테이블 전체 맥락을 바탕으로
+          기능 단위의 설명을 생성. TC 1행의 '기능 설명'을 그대로 복사하지 않음.
+    [REQ2] 결과는 'OO는 OO합니다' 형태의 자연어 문장으로 반환.
+    """
+    name = (feature_name or "해당 기능").strip()
+    nlow = name.lower()
+
+    # 엔드포인트/텍스트 전체를 단서로 활용(LLM 결과 테이블 전체 기반)
+    joined_text = " ".join(df[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()).lower()
+
+    # 대표 휴리스틱 (기능 키워드 기반) — LLM이 생성한 섹션명/키와 연동
+    if any(k in nlow for k in ["health", "status", "ping"]):
+        return _ensure_oo_sentence(name, "서비스의 가용 상태를 주기적으로 확인합니다")
+    if any(k in nlow for k in ["auth", "login", "signin", "token", "verify"]):
+        return _ensure_oo_sentence(name, "인증·인가 절차를 검증하고 접근 권한을 제어합니다")
+    if any(k in nlow for k in ["add", "sum", "plus"]):
+        return _ensure_oo_sentence(name, "두 수의 합을 계산하여 결과를 반환합니다")
+    if any(k in nlow for k in ["div", "divide", "quotient"]):
+        # 예외 단서가 보이면 0 나눗셈까지 포함
+        if "0" in joined_text or "zero" in joined_text or "zerodivision" in joined_text:
+            return _ensure_oo_sentence(name, "두 수를 나누어 결과를 반환하며 0으로 나누는 경우 예외를 발생시킵니다")
+        return _ensure_oo_sentence(name, "두 수를 나누어 결과를 반환합니다")
+    if any(k in nlow for k in ["email", "validate", "regex", "isemail"]):
+        return _ensure_oo_sentence(name, "입력 문자열이 유효한 이메일 형식인지 검사합니다")
+    if any(k in nlow for k in ["upload", "download", "client", "request", "socket"]):
+        return _ensure_oo_sentence(name, "파일·네트워크 I/O 동작을 수행하고 오류를 처리합니다")
+    if any(k in nlow for k in ["delete", "remove"]):
+        return _ensure_oo_sentence(name, "대상 리소스를 삭제하고 멱등성을 보장합니다")
+    if any(k in nlow for k in ["read", "get", "fetch", "load", "query"]):
+        return _ensure_oo_sentence(name, "요청한 식별자로 데이터를 조회하여 반환합니다")
+    if any(k in nlow for k in ["write", "save", "create", "insert", "post", "put", "update"]):
+        return _ensure_oo_sentence(name, "입력 페이로드를 검증한 뒤 데이터를 생성·수정합니다")
+
+    # 테이블 맥락에서 단서 추출 (예외/경계 케이스가 두드러질 때)
+    if any(k in joined_text for k in ["error", "exception", "오류", "예외", "401", "403", "404", "timeout", "타임아웃"]):
+        return _ensure_oo_sentence(name, "정상·예외 시나리오를 포괄적으로 검증하여 안정성을 확보합니다")
+    if any(k in joined_text for k in ["경계", "boundary", "최대", "최소", "음수", "소수", "overflow", "underflow"]):
+        return _ensure_oo_sentence(name, "경계값을 포함한 다양한 입력에 대해 일관된 동작을 보장합니다")
+
+    # 기본 폴백: 기능 핵심 동작을 검증
+    return _ensure_oo_sentence(name, "핵심 동작을 검증하여 일관성과 신뢰성을 보장합니다")
+
 def _feature_korean_desc(name: str, fallback_from_rows: str = "") -> str:
+    # (기존 함수는 TC 1행을 차용하는 폴백 때문에 '복붙' 현상 유발)
+    # [REQ1][FIX] 더 이상 TC 1행을 그대로 사용하지 않도록 비활성화(호출지에서 대체).
     n = (name or "").lower()
     if any(k in n for k in ["add", "sum", "plus"]):
         return "두 개의 수를 더해 결과를 반환합니다."
@@ -677,9 +754,7 @@ def _feature_korean_desc(name: str, fallback_from_rows: str = "") -> str:
         return "문자열이 유효한 이메일 형식인지 검사합니다."
     if "health" in n:
         return "헬스체크 엔드포인트의 가용성을 확인합니다."
-    # [ADD] 적절한 휴리스틱이 없을 경우, 첫 행의 기능 설명을 짧게 차용
-    fb = fallback_from_rows.strip()
-    return fb if fb else f"‘{name}’ 기능의 핵심 동작을 검증합니다."
+    return f"‘{name}’ 기능의 핵심 동작을 검증합니다."
 
 def _extract_endpoints(text: str) -> list[str]:
     eps = set(re.findall(r"/[A-Za-z0-9_\-./]+", text))
@@ -704,9 +779,9 @@ def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
     for feature_name, df in groups.items():
         df_norm = _ensure_priorities(df)
 
-        # 기능 설명: 휴리스틱 + 첫 행 보조
-        first_desc = str(df_norm.iloc[0]["기능 설명"]) if len(df_norm) else ""
-        func_desc = _feature_korean_desc(feature_name, fallback_from_rows=first_desc)
+        # [REQ1][REQ2][FIX] 기능 설명: LLM 소스 분석 결과(= 섹션명/키/전체행) 기반 문장 생성
+        #  - TC 1행 '기능 설명'을 그대로 복붙하지 않음
+        func_desc = _generate_function_description(feature_name, df_norm)
 
         # 우선순위 분포
         pr = _priority_counts(df_norm)
