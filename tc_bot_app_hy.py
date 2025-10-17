@@ -620,10 +620,70 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
     return pd.DataFrame(result, columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
 
 # ────────────────────────────────────────────────
-# [ADD] 동적 설명 생성을 위한 유틸
+# [ADD] 동적 설명 생성을 위한 유틸 (우선순위 정규화/추론 포함)
 # ────────────────────────────────────────────────
+# [ADD] 우선순위 토큰 정규화
+def _normalize_priority_token(v: str) -> str:
+    s = str(v or "").strip().lower()
+    if not s:
+        return ""
+    # 숫자/약어/국문 포함 매핑
+    mapping = {
+        "1": "High", "h": "High", "high": "High", "높음": "High", "상": "High",
+        "2": "Medium", "m": "Medium", "med": "Medium", "medium": "Medium", "중간": "Medium", "보통": "Medium", "중": "Medium",
+        "3": "Low", "l": "Low", "low": "Low", "낮음": "Low", "하": "Low"
+    }
+    return mapping.get(s, "High" if "high" in s else ("Medium" if "med" in s else ("Low" if "low" in s else "")))
+
+# [ADD] 행 단위 우선순위 추론
+def _infer_priority_from_text(text: str) -> str:
+    s = (text or "").lower()
+    # 예외/치명 키워드 → High
+    if any(k in s for k in ["zerodivision", "division by zero", "0으로", "error", "exception", "fatal", "권한", "unauthorized", "forbidden", "not found", "401", "403", "404", "timeout", "타임아웃", "invalid", "오류"]):
+        return "High"
+    # 경계/부동소수/음수/최대최소 → Medium
+    if any(k in s for k in ["경계", "boundary", "edge", "최대", "최소", "음수", "소수", "float", "overflow", "underflow"]):
+        return "Medium"
+    # 기본 정상 → Medium(기본 검증 중요도)
+    return "Medium"
+
+# [ADD] DF 전체에 대해 우선순위 정규화+추론 반영
+def _ensure_priorities(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    if "우선순위" not in df2.columns:
+        df2["우선순위"] = ""
+    norm_vals = []
+    for _, row in df2.iterrows():
+        raw = str(row.get("우선순위", "")).strip()
+        merged_text = " ".join([str(row.get(c, "")) for c in ["기능 설명", "입력값", "예상 결과"]])
+        norm = _normalize_priority_token(raw)
+        if not norm:
+            norm = _infer_priority_from_text(merged_text)
+        norm_vals.append(norm)
+    df2["우선순위"] = norm_vals
+    return df2
+
+# [FIX] 우선순위 분포 계산: 정규화/추론 이후 카운트
+def _priority_counts(df: pd.DataFrame) -> dict:
+    df2 = _ensure_priorities(df)
+    vals = df2["우선순위"].astype(str).str.strip().str.title().tolist()
+    c = Counter(vals)
+    return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
+
+# [ADD] 기능명 → 한국어 설명 휴리스틱
+def _feature_korean_desc(name: str) -> str:
+    n = (name or "").lower()
+    if any(k in n for k in ["add", "sum", "plus"]):
+        return "두 개의 수를 더해 결과를 반환합니다."
+    if any(k in n for k in ["div", "divide"]):
+        return "두 수를 나누어 결과를 반환하며, 0으로 나누는 경우 예외가 발생합니다."
+    if any(k in n for k in ["email", "isemail", "validator", "validate"]):
+        return "문자열이 유효한 이메일 형식인지 검사합니다."
+    if "health" in n:
+        return "헬스체크 엔드포인트의 가용성을 확인합니다."
+    return f"‘{name}’ 기능의 핵심 동작을 검증합니다."
+
 def _extract_tc_suffix_range(df: pd.DataFrame) -> str:
-    # tc-<feature>-NNN 형식의 뒤 숫자 범위를 "001–00N"으로 표기
     nums = []
     for x in df["TC ID"].astype(str).tolist():
         m = re.search(r"-(\d{3,4})$", x.strip())
@@ -638,69 +698,91 @@ def _extract_tc_suffix_range(df: pd.DataFrame) -> str:
 
 def _extract_endpoints(text: str) -> list[str]:
     eps = set(re.findall(r"/[A-Za-z0-9_\-./]+", text))
-    # 너무 긴 경로/중복 정리
     cleaned = sorted({e.strip().rstrip(".,)") for e in eps if len(e) <= 64})
     return cleaned[:5]
 
 def _extract_methods(text: str) -> list[str]:
-    # 메서드/함수명 패턴 추출: name(  또는 Class.method(
     methods = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
-    # 흔한 키워드/불용어 제거
     stop = {"if","for","while","return","print","len","map","filter","sum","add","sub","div","is","get","set","post","put"}
     filtered = sorted([m for m in methods if m.lower() not in stop])[:5]
     return filtered
 
 def _classify_scenario_bucket(s: str) -> str:
     s = s.lower()
-    # 간단 휴리스틱: 정상/예외/경계
     if any(k in s for k in ["오류", "error", "예외", "invalid", "0으로", "zero", "null", "timeout", "권한", "401", "403", "404"]):
         return "예외"
     if any(k in s for k in ["경계", "boundary", "최대", "최소", "음수", "소수", "edge", "limit"]):
         return "경계"
     return "정상"
 
-def _priority_counts(df: pd.DataFrame) -> dict:
-    vals = df["우선순위"].astype(str).str.strip().str.title().tolist()
-    c = Counter(vals)
-    return {"High": c.get("High", 0), "Medium": c.get("Medium", 0), "Low": c.get("Low", 0)}
-
-# [ADD] 실제로 화면에 넣을 동적 설명 마크다운 생성
+# [FIX] 실제로 화면에 넣을 동적 설명 마크다운 생성 (과거 스타일 반영)
 def build_dynamic_explanations(groups: dict[str, pd.DataFrame]) -> str:
     if not groups:
         return "_설명을 생성할 데이터가 없습니다._"
 
     parts = []
     for feature_name, df in groups.items():
-        # 텍스트 풀기
+        # 우선순위 정규화 반영
+        df_norm = _ensure_priorities(df)
+
         merged_text = " ".join(
-            df[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()
+            df_norm[["기능 설명","입력값","예상 결과"]].astype(str).fillna("").values.ravel().tolist()
         )
         endpoints = _extract_endpoints(merged_text)
         methods = _extract_methods(merged_text)
-        pr = _priority_counts(df)
+        pr = _priority_counts(df_norm)
 
         # 시나리오 버킷
         buckets = Counter()
-        for _, row in df.iterrows():
+        for _, row in df_norm.iterrows():
             s = " ".join([str(row.get(c,"")) for c in ["기능 설명","입력값","예상 결과"]])
             buckets[_classify_scenario_bucket(s)] += 1
 
-        rng = _extract_tc_suffix_range(df)
-        total = len(df)
+        rng = _extract_tc_suffix_range(df_norm)
+        total = len(df_norm)
 
-        # [FIX] 기능별 설명 문단(동적)
+        # [ADD] 기능 설명(자연어) + 근거 문구(기능별로 상이)
+        func_desc = _feature_korean_desc(feature_name)
+        # 기능별 우선순위 근거 생성(내용 따라 변동)
+        reasons = []
+        if buckets.get("예외", 0) > 0:
+            reasons.append("예외 시나리오가 포함되어 시스템 안정성 측면에서 중요")
+        if any(k in ("/health " + " ".join(endpoints)) for k in ["/health"]):
+            reasons.append("가용성/모니터링 관점에서 핵심")
+        if any(k in feature_name.lower() for k in ["div", "divide"]):
+            reasons.append("0으로 나누기 등 치명 예외 처리 필요")
+        if any(k in feature_name.lower() for k in ["email", "isemail", "validator"]):
+            reasons.append("입력 검증 실패가 보안/품질에 영향")
+        if not reasons:
+            reasons.append("핵심 기능의 정확성과 예외 처리를 함께 검증")
+
+        # 헤더(과거 텍스트 느낌 유지)
         parts.append(f"#### {feature_name}  _(tc-…-{rng}, 총 {total}건)_")
-        bullet_lines = []
+        parts.append(f"**기능 설명:** {func_desc}")
+
+        # 엔드포인트/메서드가 있으면 참고 정보
         if endpoints:
-            bullet_lines.append(f"- **대상 엔드포인트**: {', '.join(endpoints)}")
+            parts.append(f"- 대상 엔드포인트: {', '.join(endpoints)}")
         if methods:
-            bullet_lines.append(f"- **주요 메서드/함수**: {', '.join(methods)}")
-        bullet_lines.append(f"- **시나리오 커버리지**: 정상 {buckets.get('정상',0)}건 · 예외 {buckets.get('예외',0)}건 · 경계 {buckets.get('경계',0)}건")
-        bullet_lines.append(f"- **우선순위 분포**: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
-        # 요약 한줄
-        focus_hint = "핵심/예외 위주 High 부여, 일반 시나리오 Medium, 낮은 영향 Low"  # 안내성(일반 규칙)
-        bullet_lines.append(f"- **요약**: 기능 요구를 중심으로 정상·예외·경계 상황을 포괄 검증합니다. ({focus_hint})")
-        parts.append("\n".join(bullet_lines))
+            parts.append(f"- 주요 메서드/함수: {', '.join(methods)}")
+
+        # 버킷/분포
+        parts.append(f"- 시나리오 커버리지: 정상 {buckets.get('정상',0)}건 · 예외 {buckets.get('예외',0)}건 · 경계 {buckets.get('경계',0)}건")
+        parts.append(f"- 우선순위 분포: High {pr['High']} · Medium {pr['Medium']} · Low {pr['Low']}")
+
+        # 우선순위 정리(과거 스타일)
+        parts.append("**우선순위 정리:**")
+        # 대표 규칙을 기능/버킷 기반으로 가변 서술
+        pr_lines = []
+        if buckets.get("예외",0) > 0:
+            pr_lines.append("- 예외/치명 케이스는 High로 분류")
+        if buckets.get("경계",0) > 0:
+            pr_lines.append("- 음수/소수/최대·최소 등 경계는 Medium 중심")
+        pr_lines.append("- 정상 시나리오는 기능의 중요도에 따라 Medium/Low로 분류")
+        parts.extend(pr_lines)
+
+        # 요약(기능별로 이유 포함)
+        parts.append(f"**요약:** {', '.join(reasons)}를 근거로 정상·예외·경계 전 범위를 검증하도록 구성했습니다.")
         parts.append("")  # spacing
 
     return "\n".join(parts).strip()
@@ -773,8 +855,7 @@ with code_tab:
                             except:
                                 continue
 
-                # [FIX] 프롬프트 보강: 기능별 섹션 강제 + TCID 규칙 명시 + 힌트 제공
-                # (요청3 관련) 설명 텍스트는 LLM 산출물 밖에서 동적 생성하므로, 프롬프트에는 표만 생성하도록 유지
+                # [FIX] 프롬프트 보강 (표만 생성하도록 유도)
                 feature_hints = st.session_state.get("feature_hints") or {}
                 hint_blocks = []
                 for key, toks in feature_hints.items():
@@ -830,7 +911,7 @@ with code_tab:
                 st.session_state.last_role = qa_role
                 st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: 헤더 문구 + 동적 설명 섹션
+    # [FIX] 결과 표시: 헤더 문구 + 동적 설명 섹션(과거 스타일)
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
         # (요청1) 문구 변경
@@ -846,13 +927,12 @@ with code_tab:
         # 정규화된 원문(테이블들) 출력
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
-        # [FIX] (요청3) 기능별 테이블을 기반으로 "설명"을 동적으로 생성하여 표시
+        # [FIX] 기능별 테이블을 기반으로 "설명"을 동적으로 생성하여 표시 (과거 텍스트 느낌 유지)
         st.markdown("---")
         st.markdown("### 설명")
         try:
             groups_for_desc = st.session_state.parsed_groups
             if not groups_for_desc:
-                # 정규화 마크다운에서 재파싱 시도
                 md = st.session_state.get("normalized_markdown") or st.session_state.get("llm_result") or ""
                 groups_for_desc = group_tables_and_renumber(md)
             dynamic_md = build_dynamic_explanations(groups_for_desc or {})
@@ -862,39 +942,36 @@ with code_tab:
             st.markdown("_기능별 테이블을 기준으로 정상·예외·경계, 우선순위 분포를 요약합니다._")
 
     # [FIX] (요청4) 무슨 일이 있어도 '엑셀 다운로드' 버튼은 항상 표시
-    # - 가능하면 parsed_groups/parsed_df로 내보내고,
-    # - 없으면 normalized_markdown/llm_result를 재파싱하여 단일 시트로 내보냄,
-    # - 둘 다 없으면 빈 템플릿을 제공.
     excel_bytes = None
     try:
         bio = io.BytesIO()
         if st.session_state.get("parsed_groups"):
             with pd.ExcelWriter(bio, engine="openpyxl") as writer:
                 for key, df in st.session_state.parsed_groups.items():
+                    # 저장 전 우선순위 정규화로 일관성 개선
+                    df_out = _ensure_priorities(df)
                     sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key)[:31] or "General"
-                    df.to_excel(writer, index=False, sheet_name=sheet)
+                    df_out.to_excel(writer, index=False, sheet_name=sheet)
             excel_bytes = bio.getvalue()
         elif st.session_state.get("parsed_df") is not None:
             with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-                st.session_state.parsed_df.to_excel(writer, index=False, sheet_name="테스트케이스")
+                pd.DataFrame(_ensure_priorities(st.session_state.parsed_df)).to_excel(writer, index=False, sheet_name="테스트케이스")
             excel_bytes = bio.getvalue()
         elif st.session_state.get("normalized_markdown") or st.session_state.get("llm_result"):
-            # [FIX] 원문을 즉석 파싱하여 최소 한 시트라도 생성
             md = st.session_state.get("normalized_markdown") or st.session_state.get("llm_result") or ""
             groups = group_tables_and_renumber(md)
             with pd.ExcelWriter(bio, engine="openpyxl") as writer:
                 if groups:
                     for key, df in groups.items():
+                        df_out = _ensure_priorities(df)
                         sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key)[:31] or "General"
-                        df.to_excel(writer, index=False, sheet_name=sheet)
+                        df_out.to_excel(writer, index=False, sheet_name=sheet)
                 else:
-                    # 테이블 파싱 실패 시 빈 템플릿
                     pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"]).to_excel(
                         writer, index=False, sheet_name="테스트케이스"
                     )
             excel_bytes = bio.getvalue()
         else:
-            # 아직 어떤 결과도 없는 초기상태 → 빈 템플릿
             with pd.ExcelWriter(bio, engine="openpyxl") as writer:
                 pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"]).to_excel(
                     writer, index=False, sheet_name="테스트케이스"
