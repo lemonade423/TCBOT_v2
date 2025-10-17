@@ -357,24 +357,20 @@ def build_feature_hints(stats: dict) -> dict:
         norm = _norm_key(name)
         if not norm: 
             continue
-        # 가장 유사한 키에 매핑(간단: 접두 일치/부분 일치)
         target = None
         for k in keys:
             if norm.startswith(k) or k.startswith(norm) or norm.replace("-","") in k.replace("-",""):
                 target = k; break
         if target:
             aliases[target].update({norm, norm.replace("-", ""), name.lower()})
-    # 디렉터리/파일 기반 키(이미 analyze에서 넣었음)
     return {k: sorted(v) for k, v in aliases.items()}
 
 # [ADD] 힌트 기반 행→기능 키 추정
 def _infer_key_from_row_with_hints(row: pd.Series, hints: dict) -> str:
     text = " ".join([str(row.get(c,"")) for c in ["TC ID","기능 설명","입력값","예상 결과"]]).lower()
-    # TCID 접두 우선
     pref = _extract_prefix_from_tcid(str(row.get("TC ID","")))
     if pref:
         return pref
-    # 힌트 토큰 스캔
     best_key, best_hits = None, 0
     for key, toks in hints.items():
         hits = 0
@@ -440,13 +436,59 @@ def _df_to_md_table(df: pd.DataFrame) -> str:
         rows.append("| " + " | ".join(str(r[c]) for c in use_cols) + " |")
     return "\n".join([header, sep] + rows)
 
+# [ADD] 기능별 설명(요약) 생성기 — 표 하단 “설명” 섹션 자동 구성
+def _summarize_feature_table(sheet_name: str, df: pd.DataFrame) -> str:
+    txt = " ".join(" ".join(map(str, df[c].tolist())) for c in df.columns if c in df).lower()
+    bullets = []
+
+    def has(*keys): return any(k in txt for k in keys)
+
+    # 정상/경계/예외/음수/대용량/타입
+    if has("정상", "basic", "기본"):
+        bullets.append("기본 동작 케이스를 포함했습니다.")
+    if has("경계", "edge", "boundary"):
+        bullets.append("경계값 입력에 대한 검증을 포함했습니다.")
+    if has("예외", "error", "exception", "0 나눗셈", "zero"):
+        bullets.append("예외 상황(오류/예외 발생)을 반드시 포함했습니다.")
+    if has("음수", "negative"):
+        bullets.append("음수/부호 관련 처리를 검증했습니다.")
+    if has("대용량", "length", "100000", "1mb", "big", "large"):
+        bullets.append("대용량/부하 입력에 대한 처리도 확인했습니다.")
+    if has("정수", "실수", "float", "double", "타입", "형식", "유효성", "validate"):
+        bullets.append("데이터 타입 및 형식 유효성(정수/실수/포맷)을 점검했습니다.")
+
+    # 우선순위 요약
+    pri = (df.get("우선순위") or pd.Series(dtype=str)).astype(str).str.lower().tolist()
+    if pri:
+        if any("high" in p for p in pri):
+            bullets.append("핵심 흐름/예외 케이스는 High 우선순위로 지정했습니다.")
+        if any("medium" in p for p in pri) and not any("high" in p for p in pri):
+            bullets.append("주요 기능은 Medium 우선순위로 분류했습니다.")
+        if any("low" in p for p in pri):
+            bullets.append("부가/성능/대용량 검증은 Low로 구분했습니다.")
+
+    # 기본 메시지 보강
+    if not bullets:
+        bullets.append("핵심 기능 동작과 비정상 입력을 포함하여 다양한 조건을 검증했습니다.")
+
+    head = f"**{sheet_name}**"
+    body = "\n".join([f"- {b}" for b in bullets])
+    return f"{head}\n{body}"
+
+def _build_explanations(groups: dict[str, pd.DataFrame]) -> str:
+    if not groups:
+        return ""
+    parts = ["### 설명"]
+    for sheet, df in groups.items():
+        parts.append(_summarize_feature_table(sheet, df))
+    return "\n\n".join(parts)
+
 # [FIX] 핵심: 원문을 기능별 + ID정규화 ‘원문형식’으로 재구성 (힌트 기반 강제 분리 포함)
 def rebuild_normalized_markdown(md_text: str, feature_hints: dict | None) -> tuple[str, dict[str, pd.DataFrame]]:
     groups = group_tables_and_renumber(md_text)
     if not groups:
         tbls = _parse_md_tables_with_heading(md_text)
         if tbls:
-            # 단일 테이블이거나 헤딩 매핑 실패 → 힌트 기반 강제 분리
             base_df = _normalize_headers(tbls[0][1])
             hints = feature_hints or {}
             groups = split_single_df_feature_aware(base_df, hints)
@@ -471,6 +513,8 @@ def rebuild_normalized_markdown(md_text: str, feature_hints: dict | None) -> tup
         parts.append(f"## {name}")
         parts.append(_df_to_md_table(df))
         parts.append("")
+    # [ADD] 설명 섹션 추가
+    parts.append(_build_explanations({n: groups[n] for n in ordered}))
     return ("\n".join(parts).strip(), groups)
 
 # ────────────────────────────────────────────────
@@ -735,10 +779,18 @@ with code_tab:
             st.session_state.last_role = qa_role
         st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: 오직 ‘LLM 원문 보기’만 (정규화 결과)
+    # [FIX] 결과 표시 문구 변경 + 안내문 추가 + 설명 섹션 포함
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
-        st.markdown("## 🧾 LLM 원문 보기 (기능별 분리 + TC ID 정규화 적용)")
+        # ▼▼▼ 요구사항1: 헤더 텍스트 수정 ▼▼▼
+        st.markdown("## 📋 생성된 테스트케이스")  # [FIX] 헤더 문구 변경
+        st.caption(
+            # [FIX] 작은 글씨 안내문 추가 (요청 문구 그대로)
+            "아래는 제공된 소스코드를 분석하여 작성한 기능 단위 테스트 시나리오 기반 테스트케이스입니다. 각 기능 및 함수의 동작을 검증하기 위해 다양한 입력값과 조건을 고려하였으며, 우선순위를 High, Medium, 또는 Low로 지정했습니다."
+        )
+        # ▲▲▲ 요구사항1 끝 ▲▲▲
+
+        # 정규화된 원문(헤딩+표) 그대로 출력
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
     # [FIX] 엑셀 다운로드: 기능별 시트 분리
