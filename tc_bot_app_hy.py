@@ -828,8 +828,7 @@ with code_tab:
 - **TC ID는 반드시 tc-<feature-key>-NNN 형식**을 사용하라. (예: tc-alarm-001)
 - <feature-key>는 아래 힌트 목록의 key 중 가장 적합한 값을 사용한다.
 - 각 기능 섹션마다 NNN은 001부터 다시 시작한다.
-# [REQ] 자연스러운 설명 허용: 이전 버전처럼 필요 시 설명/요약을 함께 작성할 수 있도록, 불필요 텍스트 금지 규칙을 제거함
-# - 기능 섹션 외의 불필요한 텍스트는 넣지 말라.
+- 각 기능 섹션 아래에 생성된 테스트케이스에 관한 설명을 작성한다.
 
 [기능 힌트 목록]
 {hints_md}
@@ -887,22 +886,6 @@ with code_tab:
 
         # [REQ] 설명 하드코딩 출력 제거: 고정 "설명" 섹션을 주석 처리하여
         # 테이블 아래에 고정 문구가 항상 붙는 동작을 비활성화
-        """
-        # --- 아래 블록 전체 주석 처리 (고정 설명 제거) ---
-        st.markdown("---")
-        st.markdown("### 설명")
-        try:
-            groups_for_desc = st.session_state.parsed_groups
-            if not groups_for_desc:
-                md = st.session_state.get("normalized_markdown") or st.session_state.get("llm_result") or ""
-                groups_for_desc = group_tables_and_renumber(md)
-            dynamic_md = build_dynamic_explanations(groups_for_desc or {})
-            st.markdown(dynamic_md)
-        except Exception as _e:
-            st.caption("설명 생성 중 경고: 동적 요약에 실패하여 기본 안내만 표시합니다.")
-            st.markdown("_기능별 테이블을 기준으로 우선순위 분포와 요약을 제공합니다._")
-        # --- 주석 처리 끝 ---
-        """
 
     # [FIX] (요청4) 무슨 일이 있어도 '엑셀 다운로드' 버튼은 항상 표시
     excel_bytes = None
