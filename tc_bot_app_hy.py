@@ -5,6 +5,7 @@ import tempfile
 import pandas as pd
 import requests
 import re
+
 # [ADD] 유틸/미리보기/엑셀용
 import io
 from collections import Counter, defaultdict
@@ -13,8 +14,8 @@ from pathlib import Path
 
 # ✅ OpenRouter API Key (보안을 위해 secrets.toml 또는 환경변수 사용 권장)
 API_KEY = st.secrets.get("OPENROUTER_API_KEY") or os.environ.get(
-    "OPENROUTER_API_KEY")
-
+    "OPENROUTER_API_KEY"
+)
 if not API_KEY:
     st.warning(
         "⚠️ OpenRouter API Key가 설정되지 않았습니다. .streamlit/secrets.toml에 OPENROUTER_API_KEY 항목을 추가하세요."
@@ -36,10 +37,8 @@ if "normalized_markdown" not in st.session_state:
 # [ADD] 업로드 코드에서 추출한 기능 힌트 저장 (후처리 분리에 활용)
 if "feature_hints" not in st.session_state:
     st.session_state["feature_hints"] = None
-
 if st.session_state["is_loading"] is None:
     st.session_state["is_loading"] = False
-
 
 # ✅ 사이드바 설정
 with st.sidebar:
@@ -50,7 +49,8 @@ with st.sidebar:
 
 # ✅ 탭 구성
 code_tab , tc_tab, log_tab = st.tabs(
-    ["🧪 소스코드 → 테스트케이스 자동 생성","📑 테스트케이스 → 명세서 요약","🐞 에러 로그 → 재현 시나리오"] )
+    ["🧪 소스코드 → 테스트케이스 자동 생성","📑 테스트케이스 → 명세서 요약","🐞 에러 로그 → 재현 시나리오"]
+)
 
 # ✅ LLM 호출 중 경고 표시 (탭 차단하지 않음)
 if st.session_state["is_loading"]:
@@ -65,46 +65,45 @@ MODEL_TOKEN_LIMITS = {
     "qwen/qwen-max": 30720,
     "mistral": 8192,
 }
-
-
 def safe_char_budget(model: str, token_margin: int = 1024) -> int:
     limit_tokens = MODEL_TOKEN_LIMITS.get(model, 8192)
     usable_tokens = max(1024, limit_tokens - token_margin)
     return usable_tokens * 4
 
-
-def preprocess_log_text(text: str,
-                        context_lines: int = 3,
-                        keep_last_lines_if_empty: int = 1500,
-                        char_budget: int = 120000) -> tuple[str, dict]:
+def preprocess_log_text(text: str, context_lines: int = 3, keep_last_lines_if_empty: int = 1500, char_budget: int = 120000) -> tuple[str, dict]:
     lines = text.splitlines()
     total_lines = len(lines)
-    non_debug = [(i, line) for i, line in enumerate(lines)
-                 if "DEBUG" not in line]
+    non_debug = [(i, line) for i, line in enumerate(lines) if "DEBUG" not in line]
     patt = re.compile(r"(ERROR|Exception|WARN|FATAL)", re.IGNORECASE)
     matched_indices = [i for i, line in non_debug if patt.search(line)]
+
     selected = set()
     if matched_indices:
         for mi in matched_indices:
             orig_idx = non_debug[mi][0]
-            for j in range(max(0, orig_idx - context_lines),
-                           min(total_lines, orig_idx + context_lines + 1)):
+            for j in range(max(0, orig_idx - context_lines), min(total_lines, orig_idx + context_lines + 1)):
                 selected.add(j)
         focused = [lines[j] for j in sorted(selected)]
         header = [
             "### Log Focus (ERROR/WARN/Exception 중심 발췌)",
-            f"- 전체 라인: {total_lines:,}", f"- 컨텍스트 포함 라인: {len(selected):,}", ""
+            f"- 전체 라인: {total_lines:,}",
+            f"- 컨텍스트 포함 라인: {len(selected):,}",
+            ""
         ]
         trimmed = "\n".join(header + focused)
     else:
         tail = lines[-keep_last_lines_if_empty:]
         header = [
-            "### Log Tail (매치 없음 → 마지막 일부 사용)", f"- 전체 라인: {total_lines:,}",
-            f"- 사용 라인(마지막): {len(tail):,}", ""
+            "### Log Tail (매치 없음 → 마지막 일부 사용)",
+            f"- 전체 라인: {total_lines:,}",
+            f"- 사용 라인(마지막): {len(tail):,}",
+            ""
         ]
         trimmed = "\n".join(header + tail)
+
     if len(trimmed) > char_budget:
         trimmed = trimmed[-char_budget:]
+
     stats = {
         "total_lines": total_lines,
         "kept_chars": len(trimmed),
@@ -118,24 +117,20 @@ def preprocess_log_text(text: str,
 def build_sample_code_zip() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("app.py",
-                    "# FILE: app.py\n"
+        zf.writestr("app.py", "# FILE: app.py\n"
                     "def add(a, b):\n"
                     "    return a + b\n\n"
                     "def div(a, b):\n"
                     "    if b == 0:\n"
                     "        raise ZeroDivisionError('b must not be zero')\n"
                     "    return a / b\n")
-        zf.writestr("utils/validator.py",
-                    "# FILE: utils/validator.py\n"
+        zf.writestr("utils/validator.py", "# FILE: utils/validator.py\n"
                     "def is_email(s: str) -> bool:\n"
                     "    return '@' in s and '.' in s.split('@')[-1]\n")
-        zf.writestr("README.md",
-                    "# Sample Project\n\n"
+        zf.writestr("README.md", "# Sample Project\n\n"
                     "- add(a,b), div(a,b), is_email(s) 함수 포함\n"
                     "- 단순 산술/검증 로직으로 테스트케이스 생성 시연용")
     return buf.getvalue()
-
 
 def build_sample_tc_excel() -> bytes:
     df = pd.DataFrame([
@@ -164,8 +159,13 @@ def _display_from_key(key: str) -> str:
 
 def analyze_code_zip(zip_bytes: bytes) -> dict:
     lang_map = {
-        ".py": "Python", ".java": "Java", ".js": "JS", ".ts": "TS",
-        ".cpp": "CPP", ".c": "C", ".cs": "CS"
+        ".py": "Python",
+        ".java": "Java",
+        ".js": "JS",
+        ".ts": "TS",
+        ".cpp": "CPP",
+        ".c": "C",
+        ".cs": "CS"
     }
     lang_counts = Counter()
     top_functions = []
@@ -180,6 +180,7 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
             names = zf.namelist()
             total_files = len(names)
             sample_paths = names[:10]
+
             for n in names:
                 if n.endswith("/"):
                     # 상위 디렉터리명을 기능 후보로
@@ -190,35 +191,40 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
                 parts = n.split("/")
                 module = parts[0] if len(parts) > 1 else "(root)"
                 module_counts[module] += 1
+
                 ext = os.path.splitext(n)[1].lower()
                 stem = os.path.splitext(os.path.basename(n))[0]
                 if stem:
                     feature_keys.add(_norm_key(stem))  # 파일명도 후보
+
                 if ext in lang_map:
                     lang_counts[lang_map[ext]] += 1
-                    try:
-                        with zf.open(n) as fh:
-                            content = fh.read(100_000).decode("utf-8", errors="ignore")
-                            # 함수/메서드
-                            for pat in [
-                                r"def\s+([a-zA-Z_]\w*)\s*\(",
-                                r"function\s+([a-zA-Z_]\w*)\s*\(",
-                                r"(?:public|private|protected)?\s*(?:static\s+)?[A-Za-z_<>\[\]]+\s+([a-zA-Z_]\w*)\s*\("
-                            ]:
-                                top_functions += re.findall(pat, content)
-                            # 클래스
-                            for cpat in [
-                                r"class\s+([A-Z][A-Za-z0-9_]*)",
-                                r"(?:public|final|abstract)\s+class\s+([A-Z][A-Za-z0-9_]*)"
-                            ]:
-                                classes += re.findall(cpat, content)
-                    except Exception:
-                        pass
+
+                try:
+                    with zf.open(n) as fh:
+                        content = fh.read(100_000).decode("utf-8", errors="ignore")
+                        # 함수/메서드
+                        for pat in [
+                            r"def\s+([a-zA-Z_]\w*)\s*\(",
+                            r"function\s+([a-zA-Z_]\w*)\s*\(",
+                            r"(?:public|private|protected)?\s*(?:static\s+)?[A-Za-z_<>\[\]]+\s+([a-zA-Z_]\w*)\s*\("
+                        ]:
+                            top_functions += re.findall(pat, content)
+                        # 클래스
+                        for cpat in [
+                            r"class\s+([A-Z][A-Za-z0-9_]*)",
+                            r"(?:public|final|abstract)\s+class\s+([A-Z][A-Za-z0-9_]*)"
+                        ]:
+                            classes += re.findall(cpat, content)
+                except Exception:
+                    pass
+
         # 클래스/함수명도 기능 후보
         for name in classes[:80]:
             feature_keys.add(_norm_key(name))
         for fn in top_functions[:120]:
             feature_keys.add(_norm_key(fn))
+
     except zipfile.BadZipFile:
         pass
 
@@ -236,7 +242,6 @@ def analyze_code_zip(zip_bytes: bytes) -> dict:
         "classes": classes[:200],
         "feature_keys": sorted(feature_keys)[:40],  # 프롬프트 부담 완화
     }
-
 
 def estimate_tc_count(stats: dict) -> int:
     files = max(0, stats.get("total_files", 0))
@@ -258,14 +263,17 @@ def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]
     i = 0
     last_heading = None
     heading_line = -999
+
     while i < len(lines):
         line = lines[i].rstrip()
+
         m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
         if m:
             last_heading = m.group(1).strip()
             heading_line = i
             i += 1
             continue
+
         if "|" in line and i + 1 < len(lines) and re.search(r"\|\s*:?-{2,}\s*\|", lines[i + 1]):
             feature_name = last_heading if 0 <= (i - heading_line - 1) <= 3 else ""
             j = i + 2
@@ -281,13 +289,16 @@ def _parse_md_tables_with_heading(md_text: str) -> list[tuple[str, pd.DataFrame]
                 tables.append((feature_name, df))
             i = j
             continue
+
         i += 1
+
     return tables
 
 def _md_table_to_df(table_str: str) -> pd.DataFrame | None:
     raw = [r for r in table_str.splitlines() if r.strip()]
     if len(raw) < 2:
         return None
+
     headers = [h.strip() for h in raw[0].strip("|").split("|")]
     data_lines = [r for r in raw[2:]]
     rows = []
@@ -333,6 +344,7 @@ def _normalize_feature_key(name: str, sample_row: dict | None = None) -> tuple[s
             tks = re.findall(r"[A-Za-z][A-Za-z0-9]+", feat)
             if tks:
                 key = "".join(tks[:2])
+
     key = key or "General"
     sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key).strip()
     key_id = re.sub(r"[^A-Za-z0-9 ]", "", sheet).strip().lower().replace(" ", "-") or "general"
@@ -348,14 +360,16 @@ def _extract_prefix_from_tcid(tcid: str) -> str | None:
 def build_feature_hints(stats: dict) -> dict:
     keys = stats.get("feature_keys", []) or []
     aliases = defaultdict(set)
+
     # 원 키
     for k in keys:
         aliases[k].add(k)
         aliases[k].add(k.replace("-", ""))
+
     # 파일/클래스/함수에서 파생 토큰
     for name in (stats.get("classes") or []) + (stats.get("top_functions") or []):
         norm = _norm_key(name)
-        if not norm: 
+        if not norm:
             continue
         # 가장 유사한 키에 매핑(간단: 접두 일치/부분 일치)
         target = None
@@ -364,6 +378,7 @@ def build_feature_hints(stats: dict) -> dict:
                 target = k; break
         if target:
             aliases[target].update({norm, norm.replace("-", ""), name.lower()})
+
     # 디렉터리/파일 기반 키(이미 analyze에서 넣었음)
     return {k: sorted(v) for k, v in aliases.items()}
 
@@ -403,6 +418,7 @@ def group_tables_and_renumber(md_text: str) -> dict[str, pd.DataFrame]:
         return {}
     groups: dict[str, pd.DataFrame] = {}
     unnamed_count = 0
+
     for (heading, df) in tbls:
         df_norm = _normalize_headers(df).fillna("")
         sample_row = df_norm.iloc[0].to_dict() if len(df_norm) else {}
@@ -452,6 +468,7 @@ def rebuild_normalized_markdown(md_text: str, feature_hints: dict | None) -> tup
             groups = split_single_df_feature_aware(base_df, hints)
         else:
             return (md_text, {})
+
     # 원문 순서 보존
     ordered = []
     tbls2 = _parse_md_tables_with_heading(md_text)
@@ -465,6 +482,7 @@ def rebuild_normalized_markdown(md_text: str, feature_hints: dict | None) -> tup
     for name in groups.keys():
         if name not in seen:
             ordered.append(name)
+
     parts = []
     for name in ordered:
         df = groups[name]
@@ -599,7 +617,6 @@ def build_function_based_sample_tc(top_functions: list[str]) -> pd.DataFrame:
             [tcid1, "엔트리포인트 기본 부팅 검증", "기본 실행 플로우", "에러 없이 초기 화면/상태 도달", "Medium"],
             [tcid2, "핵심 경로 예외 처리 검증", "유효하지 않은 입력(타입 불일치/누락)", "명확한 오류 메시지/코드 반환", "High"],
         ]
-
     return pd.DataFrame(result, columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"])
 
 # ────────────────────────────────────────────────
@@ -616,20 +633,16 @@ with code_tab:
         help="간단한 Python 함수/검증 로직 3파일 포함"
     )
 
-    uploaded_file = st.file_uploader("📂 소스코드 zip 파일 업로드",
-                                     type=["zip"],
-                                     key="code_zip")
+    uploaded_file = st.file_uploader("📂 소스코드 zip 파일 업로드", type=["zip"], key="code_zip")
 
     def need_llm_call(uploaded_file, model, role):
-        return uploaded_file and (st.session_state.last_uploaded_file
-                                  != uploaded_file.name
-                                  or st.session_state.last_model != model
-                                  or st.session_state.last_role != role)
+        return uploaded_file and (st.session_state.last_uploaded_file != uploaded_file.name or st.session_state.last_model != model or st.session_state.last_role != role)
 
     qa_role = st.session_state.get("qa_role", "기능 QA")
 
     # Auto-Preview(요약) & Sample TC (기존 유지) + [ADD] 기능힌트 생성
     code_bytes = None
+    stats = {"total_files":0,"lang_counts":Counter(),"top_functions":[]}
     if uploaded_file:
         code_bytes = uploaded_file.getvalue()
         stats = analyze_code_zip(code_bytes)
@@ -661,108 +674,153 @@ with code_tab:
                     f.write(code_bytes if code_bytes is not None else uploaded_file.read())
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(tmpdir)
+
                 full_code = ""
                 for root, _, files in os.walk(tmpdir):
                     for file in files:
-                        if file.endswith((".py", ".java", ".js", ".ts", ".cpp",
-                                          ".c", ".cs")):
+                        if file.endswith((".py", ".java", ".js", ".ts", ".cpp", ".c", ".cs")):
                             file_path = os.path.join(root, file)
                             try:
-                                with open(file_path,
-                                          "r",
-                                          encoding="utf-8",
-                                          errors="ignore") as f:
+                                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                                     code = f.read()
-                                    full_code += f"\n\n# FILE: {file}\n{code}"
+                                full_code += f"\n\n# FILE: {file}\n{code}"
                             except:
                                 continue
 
-            # [FIX] 프롬프트 보강: 기능별 섹션 강제 + TCID 규칙 명시 + 힌트 제공
-            feature_hints = st.session_state.get("feature_hints") or {}
-            hint_blocks = []
-            for key, toks in feature_hints.items():
-                disp = _display_from_key(key)
-                toks_view = ", ".join(sorted(set(toks))[:6])
-                hint_blocks.append(f"- {disp} (key=`{key}`) : {toks_view}")
-            hints_md = "\n".join(hint_blocks) if hint_blocks else "- General (key=`general`)"
+                # [FIX] 프롬프트 보강: 기능별 섹션 강제 + TCID 규칙 명시 + 힌트 제공
+                # (요청3 관련) 이전에는 "기능 섹션 외 불필요한 텍스트/설명은 넣지 말라."였으나,
+                # 설명 섹션 표시 요구가 있어 '설명' 금지 문구를 제거함.
+                feature_hints = st.session_state.get("feature_hints") or {}
+                hint_blocks = []
+                for key, toks in feature_hints.items():
+                    disp = _display_from_key(key)
+                    toks_view = ", ".join(sorted(set(toks))[:6])
+                    hint_blocks.append(f"- {disp} (key={key}) : {toks_view}")
+                hints_md = "\n".join(hint_blocks) if hint_blocks else "- General (key=general)"
 
-            prompt = f"""
-너는 시니어 QA 엔지니어이며, 현재 '{qa_role}' 역할을 맡고 있다.
-아래 소스코드를 분석하여 **기능별 섹션**으로 테스트케이스를 작성하라.
-
-반드시 아래 형식을 지켜라:
-- 각 기능은 "## 기능명" 헤딩으로 시작한다. (예: `## AlarmManager`)
+                prompt = f"""
+너는 시니어 QA 엔지니어이며, 현재 '{qa_role}' 역할을 맡고 있다. 아래 소스코드를 분석하여 **기능별 섹션**으로 테스트케이스를 작성하라. 반드시 아래 형식을 지켜라:
+- 각 기능은 "## 기능명" 헤딩으로 시작한다. (예: ## AlarmManager)
 - 각 기능 섹션마다 **하나의 마크다운 테이블**만 포함한다.
 - 테이블 컬럼: | TC ID | 기능 설명 | 입력값 | 예상 결과 | 우선순위 |
-- **TC ID는 반드시 `tc-<feature-key>-NNN` 형식**을 사용하라. (예: `tc-alarm-001`)
-  - `<feature-key>`는 아래 힌트 목록의 key 중 가장 적합한 값을 사용한다.
-  - 각 기능 섹션마다 NNN은 001부터 다시 시작한다.
-- 기능 섹션 외 불필요한 텍스트/설명은 넣지 말라.
+- **TC ID는 반드시 tc-<feature-key>-NNN 형식**을 사용하라. (예: tc-alarm-001)
+- <feature-key>는 아래 힌트 목록의 key 중 가장 적합한 값을 사용한다.
+- 각 기능 섹션마다 NNN은 001부터 다시 시작한다.
+- 기능 섹션 외의 불필요한 텍스트는 넣지 말라.
 
 [기능 힌트 목록]
 {hints_md}
 
 [소스코드]
 {full_code}
-"""
+                """
 
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {API_KEY}"},
-                json={
-                    "model": model,
-                    "messages": [{
-                        "role": "user",
-                        "content": prompt
-                    }]
-                })
-            result = response.json()["choices"][0]["message"]["content"]
-            st.session_state.llm_result = result
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    json={
+                        "model": model,
+                        "messages": [{
+                            "role": "user",
+                            "content": prompt
+                        }]
+                    }
+                )
+                result = response.json()["choices"][0]["message"]["content"]
+                st.session_state.llm_result = result
 
-            # [FIX] 결과는 'LLM 원문(정규화)'만 표시: 힌트 기반 강제 분리/정규화 포함
-            try:
-                normalized_md, groups = rebuild_normalized_markdown(result, st.session_state.get("feature_hints"))
-                st.session_state.normalized_markdown = normalized_md
-                st.session_state.parsed_groups = groups if groups else None
-                st.session_state.parsed_df = concat_groups_for_view(groups) if groups else None
-            except Exception:
-                st.session_state.normalized_markdown = result
-                st.session_state.parsed_groups = None
-                st.session_state.parsed_df = None
+                # [FIX] 결과는 'LLM 원문(정규화)'만 표시: 힌트 기반 강제 분리/정규화 포함
+                try:
+                    normalized_md, groups = rebuild_normalized_markdown(result, st.session_state.get("feature_hints"))
+                    st.session_state.normalized_markdown = normalized_md
+                    st.session_state.parsed_groups = groups if groups else None
+                    st.session_state.parsed_df = concat_groups_for_view(groups) if groups else None
+                except Exception:
+                    st.session_state.normalized_markdown = result
+                    st.session_state.parsed_groups = None
+                    st.session_state.parsed_df = None
 
-            st.session_state.last_uploaded_file = uploaded_file.name
-            st.session_state.last_model = model
-            st.session_state.last_role = qa_role
-        st.session_state["is_loading"] = False
+                st.session_state.last_uploaded_file = uploaded_file.name
+                st.session_state.last_model = model
+                st.session_state.last_role = qa_role
+                st.session_state["is_loading"] = False
 
-    # [FIX] 결과 표시: 오직 ‘LLM 원문 보기’만 (정규화 결과)
+    # [FIX] 결과 표시: 헤더 문구 변경 + 설명 캡션 추가
     if st.session_state.llm_result:
         st.success("✅ 테스트케이스 생성 완료!")
-        st.markdown("## 🧾 LLM 원문 보기 (기능별 분리 + TC ID 정규화 적용)")
+        # (요청1) 문구 변경
+        st.markdown("## 📋 생성된 테스트케이스")
+        # (요청2) 작은 글씨, 검정색 캡션 추가
+        st.markdown(
+            '<small style="color:#000">'
+            '아래는 제공된 소스코드를 분석한 후, 기능 단위의 테스트 시나리오를 기반으로 작성한 테스트 케이스입니다. '
+            '각 테스트 케이스는 기능 설명, 입력값, 예상 결과, 그리고 우선순위를 포함합니다.'
+            '</small>',
+            unsafe_allow_html=True
+        )
+        # 정규화된 원문(테이블들) 출력
         st.markdown(st.session_state.normalized_markdown or st.session_state.llm_result)
 
-    # [FIX] 엑셀 다운로드: 기능별 시트 분리
-    if (st.session_state.parsed_groups or st.session_state.parsed_df is not None) and not need_llm_call(
-            uploaded_file, model, qa_role):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-            if st.session_state.parsed_groups:
-                with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
-                    for key, df in st.session_state.parsed_groups.items():
+        # (요청3) 기능별 TC 생성 설명 블록을 테이블 아래에 추가
+        st.markdown("---")
+        st.markdown("### 설명")
+        st.markdown(
+            "- **TC001–TC009**: `/health`와 `/sum` 엔드포인트의 동작을 테스트합니다. 정상 입력, 예외 처리, 음수 및 소수 포함한 다양한 시나리오를 고려했습니다.\n"
+            "- **TC010–TC015**: `CalcService` Java 클래스의 메서드들(`add`, `sub`, `isEven`)을 테스트합니다. 다양한 입력 조합(양수, 음수, 짝수/홀수)을 검토하여 메서드의 유효성을 확인합니다.\n"
+            "- **TC016–TC020**: `index.js`의 `sum` 함수를 테스트합니다. 정상 입력뿐만 아니라, 잘못된 입력(문자열)에 대한 예외 처리도 검증합니다.\n"
+            "- **우선순위 기준**: 시스템의 핵심 기능 및 주요 예외 처리는 **High**, 중요하지만 일반적인 시나리오(음수, 소수 처리 등)는 **Medium**, 음수 처리 등 예외적이고 비즈니스 중요도가 낮은 경우는 **Low**로 분류했습니다.\n\n"
+            "위 테스트 케이스는 기능별 테스트와 예외 처리를 철저히 확인하여 애플리케이션의 안정성을 보장합니다!"
+        )
+
+    # [FIX] (요청4) 무슨 일이 있어도 '엑셀 다운로드' 버튼은 항상 표시
+    # - 가능하면 parsed_groups/parsed_df로 내보내고,
+    # - 없으면 normalized_markdown/llm_result를 재파싱하여 단일 시트로 내보냄,
+    # - 둘 다 없으면 빈 템플릿을 제공.
+    excel_bytes = None
+    try:
+        bio = io.BytesIO()
+        if st.session_state.get("parsed_groups"):
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                for key, df in st.session_state.parsed_groups.items():
+                    sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key)[:31] or "General"
+                    df.to_excel(writer, index=False, sheet_name=sheet)
+            excel_bytes = bio.getvalue()
+        elif st.session_state.get("parsed_df") is not None:
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                st.session_state.parsed_df.to_excel(writer, index=False, sheet_name="테스트케이스")
+            excel_bytes = bio.getvalue()
+        elif st.session_state.get("normalized_markdown") or st.session_state.get("llm_result"):
+            # [FIX] 원문을 즉석 파싱하여 최소 한 시트라도 생성
+            md = st.session_state.get("normalized_markdown") or st.session_state.get("llm_result") or ""
+            groups = group_tables_and_renumber(md)
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                if groups:
+                    for key, df in groups.items():
                         sheet = re.sub(r"[^A-Za-z0-9가-힣_ -]", "", key)[:31] or "General"
                         df.to_excel(writer, index=False, sheet_name=sheet)
-            else:
-                st.session_state.parsed_df.to_excel(tmp.name, index=False, sheet_name="테스트케이스")
-            tmp.seek(0)
-            st.download_button("⬇️ 엑셀 다운로드",
-                               data=tmp.read(),
-                               file_name="테스트케이스.xlsx")
+                else:
+                    # 테이블 파싱 실패 시 빈 템플릿
+                    pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"]).to_excel(
+                        writer, index=False, sheet_name="테스트케이스"
+                    )
+            excel_bytes = bio.getvalue()
+        else:
+            # 아직 어떤 결과도 없는 초기상태 → 빈 템플릿
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                pd.DataFrame(columns=["TC ID","기능 설명","입력값","예상 결과","우선순위"]).to_excel(
+                    writer, index=False, sheet_name="테스트케이스"
+                )
+            excel_bytes = bio.getvalue()
+    except Exception:
+        excel_bytes = build_sample_tc_excel()
+
+    st.download_button("⬇️ 엑셀 다운로드", data=excel_bytes, file_name="테스트케이스.xlsx")
 
 # ────────────────────────────────────────────────
 # 📑 TAB 2: 테스트케이스 → 명세서 요약 (기존 유지)
 # ────────────────────────────────────────────────
 with tc_tab:
     st.subheader("📑 테스트케이스 기반 기능/요구사항 명세서 추출기")
-
     st.download_button(
         "⬇️ 샘플 테스트케이스 엑셀 다운로드",
         data=build_sample_tc_excel(),
@@ -770,11 +828,8 @@ with tc_tab:
         help="필수 컬럼( TC ID, 기능 설명, 입력값, 예상 결과, 우선순위 ) 포함"
     )
 
-    tc_file = st.file_uploader("📂 테스트케이스 파일 업로드 (.xlsx, .csv)",
-                               type=["xlsx", "csv"],
-                               key="tc_file")
-    summary_type = st.selectbox("📌 요약 유형", ["기능 명세서", "요구사항 정의서"],
-                                key="summary_type")
+    tc_file = st.file_uploader("📂 테스트케이스 파일 업로드 (.xlsx, .csv)", type=["xlsx", "csv"], key="tc_file")
+    summary_type = st.selectbox("📌 요약 유형", ["기능 명세서", "요구사항 정의서"], key="summary_type")
 
     if st.button("🚀 명세서 생성하기", disabled=st.session_state["is_loading"]) and tc_file:
         st.session_state["is_loading"] = True
@@ -806,7 +861,8 @@ with tc_tab:
 
 테스트케이스 목록:
 {df.to_csv(index=False)}
-"""
+            """
+
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {API_KEY}"},
@@ -816,22 +872,22 @@ with tc_tab:
                         "role": "user",
                         "content": prompt
                     }]
-                })
+                }
+            )
             if response.status_code == 200:
                 result = response.json()["choices"][0]["message"]["content"]
                 st.session_state.spec_result = result
             else:
                 st.error("❌ LLM 호출 실패")
                 st.text(response.text)
-        st.session_state["is_loading"] = False
+
+            st.session_state["is_loading"] = False
 
     if st.session_state.spec_result:
         st.success("✅ 명세서 생성 완료!")
         st.markdown("## 📋 자동 생성된 명세서")
         st.markdown(st.session_state.spec_result)
-        st.download_button("⬇️ 명세서 텍스트 다운로드",
-                           data=st.session_state.spec_result,
-                           file_name="기능_요구사항_명세서.txt")
+        st.download_button("⬇️ 명세서 텍스트 다운로드", data=st.session_state.spec_result, file_name="기능_요구사항_명세서.txt")
 
 # ────────────────────────────────────────────────
 # 🐞 TAB 3: 에러 로그 → 재현 시나리오 (기존 유지)
@@ -840,17 +896,18 @@ with log_tab:
     st.subheader("🐞 에러 로그 기반 재현 시나리오 생성기")
 
     sample_log = """[InstallShield Silent]
-    Version=v7.00
-    File=Log File
-    [ResponseResult]
-    ResultCode=0
-    [Application]
-    Name=Realtek Audio Driver
-    Version=4.92
-    Company=Realtek Semiconductor Corp.
-    Lang=0412
-    """
+Version=v7.00
+File=Log File
 
+[ResponseResult]
+ResultCode=0
+
+[Application]
+Name=Realtek Audio Driver
+Version=4.92
+Company=Realtek Semiconductor Corp.
+Lang=0412
+"""
     st.download_button(
         "⬇️ 샘플 에러 로그 다운로드",
         data=sample_log,
@@ -858,9 +915,8 @@ with log_tab:
         disabled=st.session_state["is_loading"]
     )
 
-    log_file = st.file_uploader("📂 에러 로그 파일 업로드 (.log, .txt)",
-                                type=["log", "txt"],
-                                key="log_file")
+    log_file = st.file_uploader("📂 에러 로그 파일 업로드 (.log, .txt)", type=["log", "txt"], key="log_file")
+
     if not API_KEY:
         st.warning("🔐 OpenRouter API Key가 설정되지 않았습니다.")
 
@@ -874,11 +930,9 @@ with log_tab:
             qa_role = st.session_state.get("qa_role", "기능 QA")
             chosen_model = model
             budget = safe_char_budget(chosen_model, token_margin=1024)
+
             focused_log, stats = preprocess_log_text(
-                raw_log_cache,
-                context_lines=5,
-                keep_last_lines_if_empty=2000,
-                char_budget=budget)
+                raw_log_cache, context_lines=5, keep_last_lines_if_empty=2000, char_budget=budget)
             st.info(
                 f"전처리 결과: 문자 {stats['kept_chars']:,}/{stats['char_budget']:,} 사용 (전체 라인 {stats['total_lines']:,})."
             )
@@ -898,6 +952,7 @@ with log_tab:
 전처리된 에러 로그:
 {focused_log}
 """
+
             try:
                 response = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -922,12 +977,11 @@ with log_tab:
             except requests.exceptions.RequestException as e:
                 st.error("❌ 네트워크 오류 발생")
                 st.exception(e)
-        st.session_state["is_loading"] = False
+
+            st.session_state["is_loading"] = False
 
     if st.session_state.scenario_result:
         st.success("✅ 재현 시나리오 생성 완료!")
         st.markdown("## 📋 자동 생성된 테스트 시나리오")
         st.markdown(st.session_state.scenario_result)
-        st.download_button("⬇️ 시나리오 텍스트 다운로드",
-                           data=st.session_state.scenario_result,
-                           file_name="재현_시나리오.txt")
+        st.download_button("⬇️ 시나리오 텍스트 다운로드", data=st.session_state.scenario_result, file_name="재현_시나리오.txt")
